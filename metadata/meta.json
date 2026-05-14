@@ -1,0 +1,66 @@
+{
+"data_dir": "E:/Internship/MITHAML_CSV_WITH_GATING_LS/",
+"output_dir": "E:/Internship/MITHAML_CSV_CORRECTED/",
+
+"ref_plate": "Plate1",
+
+"anchors": {
+    "D0": "hBM1012",
+    "D24": "hBM_38624"
+},
+
+
+"meta_cols": [
+    "Event_length",
+    "Time",
+    "dataset",
+    "panel",
+    "plate",
+    "sample_name",
+    "cell_type",
+    "condition"
+],
+
+"celltypes": [
+    "myeloid-enriched",
+    "bulk_leukocytes",
+    "T-cells",
+    "megakaryocytic-like",
+    "CD45low/198Pt-high",
+    "CD45low",
+    "CD45inter",
+    "CD45pos",
+    "B-cells",
+    "CD45high",
+    "immature-like",
+    "cells",
+    "Unfiltered",
+    "alive",
+    "CD45neg"
+],
+
+"celltype_gating": ["T-cells", "B-cells", "megakaryocytic-like", "bulk_leukocytes"],
+
+"celltype2correct": ["T-cells", "B-cells", "megakaryocytic-like", "bulk_leukocytes"],
+
+"stable_marker": "DNA",
+
+"true_markers": [
+    "CD45", "DNA", "CD44", "CD61", "CD38", "CD71",
+    "CD45RA", "CD14", "CD3_CD19", "ME1", "GAPDH", "GSS", "CD64", "PHGDH",
+    "CS", "CD34", "DHODH", "SDHA", "CD123", "ENO1", "VDAC", "MCT4", "HK1",
+    "PFKFB4", "CD33", "ATPA5", "GPT2", "NDUFB8", "HK2", "G6PD", "pPGC1A",
+    "PGC1A", "Cleaved_Casp3", "CD133", "LDHA", "CD135", "XCT", "IDH2",
+    "CD117", "MCT1", "GLS", "ASCT2", "175Lu", "IDH1", "CD68", "cisplatin",
+    "MPO", "GLUT1", "CD11b", "PARPg", "pSTAT3", "GOT2", "p4EBP1",
+    "ACADM", "BCL-xl", "CALCRL", "CEBPa", "pSTAT5", "CD39",
+    "SLC7A6", "BCAT1", "CytC", "CD98", "DRP1", "BCL2",
+    "BCAT2", "c-myc", "P53", "ATF4", "MCL1", "PKM1", "PKM2",
+    "pS6_S235-S236", "CPT1A", "OPA1", "pAMPK_T172",
+    "pCREB_S133", "CD36"
+],
+
+"metal_to_marker": {
+    "175Lu": "PARPg"
+}
+}
