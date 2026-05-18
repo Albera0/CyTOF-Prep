@@ -16,10 +16,50 @@ from statsmodels.stats.multitest import multipletests
 from glob import glob
 
 
+from pypalettes import load_cmap as _load_cmap
+
 from .utils import harmonize_marker, apply_marker_schema, add_metadata, assign_cell_type, enforce_schema, read_cytof_file, get_indexed_files
 
+_BEFORE_COLOR = "#F56455"
+_AFTER_COLOR  = "#15134B"
+_PANEL1_COLOR = "#A1B654"
+_PANEL2_COLOR = "#B8321A"
+
+_PLATE_COLORS = [
+    "#2B9B81", "#F4C40F", "#FBE183", "#D8443C", "#9B3441",
+    "#DE597C", "#1F6E9C", "#E87B89", "#E6A2A6", "#AA7AA1",
+    "#9F5691", "#633372", "#92C051", "#FE9B00", "#FBE183",
+]
+
+
+def _savefig(save_path, fig=None, **kwargs):
+    """Save figure as PNG and SVG."""
+    _fig = fig if fig is not None else plt.gcf()
+    _fig.savefig(save_path, **kwargs)
+    svg_path = os.path.splitext(save_path)[0] + '.svg'
+    svg_kw = {k: v for k, v in kwargs.items() if k != 'dpi'}
+    svg_kw.setdefault('bbox_inches', 'tight')
+    _fig.savefig(svg_path, **svg_kw)
+
+
+def _build_celltype_palette(cell_types):
+    """Return {celltype: rgba} using Alexandrite, sorted alphabetically."""
+    sorted_types = sorted(str(ct) for ct in cell_types)
+    n = len(sorted_types)
+    if n == 0:
+        return {}
+    cmap = _load_cmap("Alexandrite")
+    return {ct: cmap(i / max(n - 1, 1)) for i, ct in enumerate(sorted_types)}
+
+
+def _build_plate_palette(plates):
+    """Assign _PLATE_COLORS to plates in sorted order."""
+    sorted_plates = sorted(str(p) for p in plates)
+    return {p: _PLATE_COLORS[i % len(_PLATE_COLORS)] for i, p in enumerate(sorted_plates)}
+
+
 # Umap visualization colored by cell type
-def umap_by_celltype(df_before, df_after, celltype_col="cell_type",
+def umap_by_celltype(df_before, df_after, celltype_col="celltypes",
                                 panel=None, markers=None, subsample=50000,
                                 n_pcs=30, n_neighbors=15, min_dist=0.3,
                                 random_state=42, size=8):
@@ -79,25 +119,29 @@ def umap_by_celltype(df_before, df_after, celltype_col="cell_type",
     sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs)
     sc.tl.umap(adata, min_dist=min_dist, random_state=random_state)
     
-    # Force consistent colors for cell types
+    # Build harmonized tab palette for all cell types
     if celltype_col in adata.obs:
-        # Get all unique cell types across Before and After
-        unique_types = sorted(adata.obs[celltype_col].unique())
-        # Use a standard Scanpy palette
-        adata.uns[f"{celltype_col}_colors"] = sc.pl.palettes.default_20[:len(unique_types)]
+        unique_types = sorted(str(ct) for ct in adata.obs[celltype_col].unique())
+        ct_palette = _build_celltype_palette(unique_types)
+        adata.uns[f"{celltype_col}_colors"] = [ct_palette.get(ct, '#808080') for ct in unique_types]
 
     # Split UMAP coordinates for Before and After
     adata_before = adata[adata.obs["Correction"]=="Before"].copy()
     adata_after = adata[adata.obs["Correction"]=="After"].copy()
-    
+
+    # Propagate the same colors explicitly so each sub-adata uses the global mapping
+    for sub in (adata_before, adata_after):
+        cats = sorted(str(ct) for ct in sub.obs[celltype_col].unique())
+        sub.uns[f"{celltype_col}_colors"] = [ct_palette.get(ct, '#808080') for ct in cats]
+
     # Plot side by side
-    fig, axes = plt.subplots(1, 2, figsize=(14,7))
-    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+
     sc.pl.umap(adata_before, color=celltype_col, ax=axes[0], show=False, size=size, legend_loc='right margin')
-    axes[0].set_title("Before Correction", fontsize=16, fontweight='bold')
-    
+    axes[0].set_title("Before", fontsize=16, fontweight='bold')
+
     sc.pl.umap(adata_after, color=celltype_col, ax=axes[1], show=False, size=size, legend_loc='right margin')
-    axes[1].set_title("After Correction", fontsize=16, fontweight='bold')
+    axes[1].set_title("After", fontsize=16, fontweight='bold')
     
     plt.tight_layout()
 
@@ -162,8 +206,8 @@ def marker_trends(df, plate, panel, markers, save_dir, window=500):
 
             # Plot
             ax = axes[i]
-            ax.plot(df_plot["Time"], smoothed, color="blue", lw=2, label="Median trend")
-            ax.fill_between(df_plot["Time"], low, high, color="blue", alpha=0.2, label="5%-95% percentile")
+            ax.plot(df_plot["Time"], smoothed, color=_BEFORE_COLOR, lw=2, label="Median trend")
+            ax.fill_between(df_plot["Time"], low, high, color=_BEFORE_COLOR, alpha=0.2, label="5%-95% percentile")
             ax.set_title(f"Sample: {sample}", fontsize=13)
             ax.set_xlabel("Acquisition Time", fontsize=15, fontweight='bold')
             ax.set_ylabel("Intensity", fontsize=15, fontweight='bold')
@@ -177,9 +221,8 @@ def marker_trends(df, plate, panel, markers, save_dir, window=500):
         plt.suptitle(f"{marker} trends over time - Plate: {plate}", fontsize=18, fontweight='bold')
         plt.tight_layout(rect=[0,0,1,0.95])
 
-        # Save figure as high-resolution PNG
         save_path = os.path.join(save_dir, f"{panel}_{plate}_{marker}_Timetrend.png")
-        fig.savefig(save_path, dpi=300)
+        _savefig(save_path, fig=fig, dpi=300)
         plt.close(fig)
 
 # Visualize the time effect on marker intensities before and after correction
@@ -193,9 +236,21 @@ def plot_time_effect_density(
     panel,
     markers,
     save_dir,
-    window_ylim=(0,10),
-    subsample=50000
+    window_ylim=None,
+    subsample=50000,
+    data_already_transformed=False,
 ):
+    """
+    Plot hexbin density of marker intensity over acquisition time, before and after
+    time-drift correction.
+
+    Args:
+        window_ylim: explicit (ymin, ymax) tuple, or None to auto-scale from data.
+        data_already_transformed: set True when the input DataFrames are already
+            arcsinh-transformed (e.g. loaded from the intermediate matrix in
+            Correction.ipynb). When False (default / pipeline.py usage), arcsinh is
+            applied here before plotting.
+    """
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
 
@@ -214,111 +269,76 @@ def plot_time_effect_density(
     ncols = 4
     nrows = max(1, int(np.ceil(len(plates) / ncols)))
 
+    def _transform(series):
+        if data_already_transformed:
+            return series.values.astype(float)
+        return np.arcsinh(series.values.astype(float) / 5)
+
     for marker in markers:
-        # Check if marker exists in both dataframes
         if marker not in before_df.columns:
             print(f"{marker} not found in dataframe. Skipping.")
             continue
 
-        # BEFORE CORRECTION
-        fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 4*nrows))
-        axes = np.array(axes).flatten()
-
-        for ax, plate in zip(axes, plates):
-            df_plate = before_df[before_df['plate'] == plate].dropna(subset=[marker])
-
-            if df_plate.empty:
-                ax.axis("off")
-                continue
-            
-            # Subsample per plate
-            if subsample is not None and len(df_plate) > subsample:
-                df_plate = df_plate.sample(n=subsample, random_state=42)
-
-            x = df_plate['Time']
-            y = df_plate[marker]
-            y = np.arcsinh(y / 5)
-
-            hb = ax.hexbin(
-                x, y,
-                gridsize=200,
-                cmap='jet',
-                bins='log'
-            )
-
-            ax.set_title(f"{marker} - {plate} (Before)", fontsize=15, fontweight='bold')
-            ax.set_xlabel("Time", fontsize=15, fontweight='bold')
-            ax.set_ylabel("Arcsinh(Intensity)", fontsize=15, fontweight='bold')
-            ax.set_ylim(window_ylim)
-            ax.xaxis.set_major_formatter(millions_formatter)
-            ax.tick_params(axis='both', labelsize=12)
-
-        for ax in axes[len(plates):]:
-            ax.axis("off")
-
-        plt.tight_layout()
-
-        if save_dir is not None:
-            save_path = os.path.join(
-                save_dir,
-                f"{panel}_{marker}_BeforeCorrection_density.png"
-            )
-            fig.savefig(save_path, dpi=300)
-            print(f"Saved: {save_path}")
+        # Compute shared ylim from combined data so before/after plots are comparable.
+        if window_ylim is None:
+            all_vals = []
+            for df in (before_df, after_df):
+                if marker in df.columns:
+                    s = df[marker].dropna()
+                    if subsample and len(s) > subsample:
+                        s = s.sample(n=subsample, random_state=42)
+                    all_vals.append(_transform(s))
+            if all_vals:
+                combined = np.concatenate(all_vals)
+                combined = combined[np.isfinite(combined)]
+                ylo = np.percentile(combined, 1)
+                yhi = np.percentile(combined, 99)
+                pad = (yhi - ylo) * 0.05 if yhi > ylo else 0.5
+                ylim = (ylo - pad, yhi + pad)
+            else:
+                ylim = (0, 10)
         else:
-            plt.show()
+            ylim = window_ylim
 
-        plt.close(fig)
+        for label, df_src in [("Before", before_df), ("After", after_df)]:
+            fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 4*nrows))
+            axes = np.array(axes).flatten()
 
-        # AFTER CORRECTION
-        fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 4*nrows))
-        axes = np.array(axes).flatten()
+            for ax, plate in zip(axes, plates):
+                df_plate = df_src[df_src['plate'] == plate].dropna(subset=[marker])
 
-        for ax, plate in zip(axes, plates):
-            df_plate = after_df[after_df['plate'] == plate].dropna(subset=[marker])
+                if df_plate.empty:
+                    ax.axis("off")
+                    continue
 
-            if df_plate.empty:
+                if subsample is not None and len(df_plate) > subsample:
+                    df_plate = df_plate.sample(n=subsample, random_state=42)
+
+                x = df_plate['Time'].values
+                y = _transform(df_plate[marker])
+
+                ax.hexbin(x, y, gridsize=200, cmap='jet', bins='log')
+                ax.set_title(f"{marker} - {plate} ({label})", fontsize=15, fontweight='bold')
+                ax.set_xlabel("Time", fontsize=15, fontweight='bold')
+                ax.set_ylabel("Arcsinh(Intensity)", fontsize=15, fontweight='bold')
+                ax.set_ylim(ylim)
+                ax.xaxis.set_major_formatter(millions_formatter)
+                ax.tick_params(axis='both', labelsize=12)
+
+            for ax in axes[len(plates):]:
                 ax.axis("off")
-                continue
-            
-            # Subsample per plate
-            if subsample is not None and len(df_plate) > subsample:
-                df_plate = df_plate.sample(n=subsample, random_state=42)
 
-            x = df_plate['Time']
-            y = df_plate[marker]
-            y = np.arcsinh(y / 5)
+            plt.tight_layout()
 
-            hb = ax.hexbin(
-                x, y,
-                gridsize=200,
-                cmap='jet',
-                bins='log'
-            )
+            suffix = "BeforeCorrection" if label == "Before" else "AfterCorrection"
+            if save_dir is not None:
+                save_path = os.path.join(save_dir, f"{panel}_{marker}_{suffix}_density.png")
+                _savefig(save_path, fig=fig, dpi=300)
+                print(f"Saved: {save_path}")
+            else:
+                plt.show()
 
-            ax.set_title(f"{marker} - {plate} (After)", fontsize=15, fontweight='bold')
-            ax.set_xlabel("Time", fontsize=15, fontweight='bold')
-            ax.set_ylabel("Arcsinh(Intensity)", fontsize=15, fontweight='bold')
-            ax.set_ylim(window_ylim)
-            ax.xaxis.set_major_formatter(millions_formatter)
-            ax.tick_params(axis='both', labelsize=12)
-
-        for ax in axes[len(plates):]:
-            ax.axis("off")
-
-        plt.tight_layout()
-
-        if save_dir is not None:
-            save_path = os.path.join(
-                save_dir,
-                f"{panel}_{marker}_AfterCorrection_density.png"
-            )
-            fig.savefig(save_path, dpi=300)
-            print(f"Saved: {save_path}")
-        else:
-            plt.show()
-
-        plt.close(fig)
+            plt.close(fig)
 
 def plot_time_effect_density_merged(
     before_df,
@@ -473,7 +493,7 @@ def plot_time_effect_density_merged(
         
         if save_dir is not None:
             save_path = os.path.join(save_dir, f"{panel}_{marker}_PlateAlignment_TimeDrift.png")
-            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            _savefig(save_path, fig=fig, dpi=300, bbox_inches='tight')
             print(f"  [SAVED] Plate alignment drift plot -> {save_path}")
         else:
             plt.show()
@@ -483,7 +503,7 @@ def plot_time_effect_density_merged(
 
 # Plot signal distributions for each marker across plates before and after correction (before and after in the same figure)
 def plot_signal_distributions_joint(df_before, df_after, panel, markers, save_dir,
-                                        lower_pct=1, upper_pct=99, colors=("C0","C1"), subsample=50000, 
+                                        lower_pct=1, upper_pct=99, colors=None, subsample=50000,
                                         kd_df=None):
     """
     Overlays 'Before' and 'After' distribution curves for every marker.
@@ -492,6 +512,9 @@ def plot_signal_distributions_joint(df_before, df_after, panel, markers, save_di
     - Adjusted P-value (FDR corrected Mann-Whitney U): Significance of the shift.
     - KL Divergence (KD): Magnitude of signal profile change.
     """
+    if colors is None:
+        colors = (_BEFORE_COLOR, _AFTER_COLOR)
+
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
 
@@ -586,7 +609,7 @@ def plot_signal_distributions_joint(df_before, df_after, panel, markers, save_di
                 
                 if len(data_b) > 0:
                     sns.kdeplot(data_b, ax=ax, color=colors[0],
-                                linewidth=2, label="Before Correction", clip=marker_ranges[marker])
+                                linewidth=2, label="Before", clip=marker_ranges[marker])
             
             # Plot After Correction
             if marker in df_a_plate.columns:
@@ -597,7 +620,7 @@ def plot_signal_distributions_joint(df_before, df_after, panel, markers, save_di
                 
                 if len(data_a) > 0:
                     sns.kdeplot(data_a, ax=ax, color=colors[1],
-                                linewidth=2, label="After Correction", clip=marker_ranges[marker])
+                                linewidth=2, label="After", clip=marker_ranges[marker])
 
             # Annotate with KL Divergence (KD) and Stats (Using FDR adjusted P)
             if marker in marker_to_stats:
@@ -633,8 +656,8 @@ def plot_signal_distributions_joint(df_before, df_after, panel, markers, save_di
             axes[row, col].axis("off")
 
         # Add global legend
-        fig.legend(handles=[Line2D([0],[0], color=colors[0], lw=3, label="Before Correction"),
-                            Line2D([0],[0], color=colors[1], lw=3, label="After Correction")],
+        fig.legend(handles=[Line2D([0],[0], color=colors[0], lw=3, label="Before"),
+                            Line2D([0],[0], color=colors[1], lw=3, label="After")],
                     loc='upper right', prop={'size': 14, 'weight': 'bold'})
 
         plt.tight_layout(rect=[0,0,0.85,0.95])
@@ -642,7 +665,7 @@ def plot_signal_distributions_joint(df_before, df_after, panel, markers, save_di
         
         if save_dir is not None:
             save_path = os.path.join(save_dir, f"{panel}_{plate}_distribution.png")
-            fig.savefig(save_path, dpi=150, bbox_inches='tight')
+            _savefig(save_path, fig=fig, dpi=150, bbox_inches='tight')
             print(f"Saved: {save_path}")
         else:
             plt.show()
@@ -652,7 +675,7 @@ def plot_signal_distributions_joint(df_before, df_after, panel, markers, save_di
 # Calculate Mann-Whitney U test p-values before and after correction for each marker
 def calculate_mwu(df_before, df_after, panel, exclude_cols=None, subsample=10000, ctx=None):
     if exclude_cols is None:
-        exclude_cols = list(ctx.meta_cols) + ["original_filename", "cell_type", "CD45pos"]
+        exclude_cols = list(ctx.meta_cols) + ["original_filename", "celltypes", "CD45pos"]
         if getattr(ctx, "celltypes", None):
             exclude_cols.extend(ctx.celltypes)
         if getattr(ctx, "celltype_gating", None):
@@ -663,12 +686,17 @@ def calculate_mwu(df_before, df_after, panel, exclude_cols=None, subsample=10000
     df_before = df_before[df_before['panel'] == panel].dropna(axis=1, how="all").copy()
     df_after = df_after[df_after['panel'] == panel].dropna(axis=1, how="all").copy()
     
-    # Select markers
-    markers = [c for c in df_before.columns if c not in exclude_cols and c in df_after.columns]
-    
+    # Select markers — restrict to true_markers when available to exclude
+    # OmiqFilter-derived gate columns (cells, Unfiltered, alive, CD45low, etc.)
+    all_cols = [c for c in df_before.columns if c not in exclude_cols and c in df_after.columns]
+    if ctx is not None and getattr(ctx, "true_markers", None):
+        markers = [m for m in all_cols if m in ctx.true_markers]
+    else:
+        markers = all_cols
+
     # Ensure markers are numeric
     markers = [m for m in markers if pd.api.types.is_numeric_dtype(df_before[m])]
-    
+
     # Subsample to speed up MWU for millions of cells
     if len(df_before) > subsample:
         df_before = df_before.sample(n=subsample, random_state=42)
@@ -682,23 +710,25 @@ def calculate_mwu(df_before, df_after, panel, exclude_cols=None, subsample=10000
         x_after = df_after[marker].dropna().values
 
         if len(x_before) == 0 or len(x_after) == 0:
-            results.append({"marker": marker, "p_value": np.nan, "statistic": np.nan, "-log10(p)": 0})
+            results.append({"marker": marker, "p_value": np.nan, "statistic": np.nan})
             continue
 
-        # Mann-Whitney U test
         stat, p = mannwhitneyu(x_before, x_after, alternative='two-sided')
-        
-        # Use -log10(p-value) for visualization
-        log_p = -np.log10(p + 1e-300) 
-        
-        results.append({
-            "marker": marker, 
-            "p_value": p, 
-            "statistic": stat,
-            "-log10(p)": log_p
-        })
+        results.append({"marker": marker, "p_value": p, "statistic": stat})
 
-    return pd.DataFrame(results).sort_values("-log10(p)", ascending=False)
+    df_res = pd.DataFrame(results)
+
+    # FDR correction (Benjamini-Hochberg) across all markers
+    valid = df_res["p_value"].notna()
+    p_adj = np.full(len(df_res), np.nan)
+    if valid.any():
+        _, p_adj_vals, _, _ = multipletests(df_res.loc[valid, "p_value"].values, method="fdr_bh")
+        p_adj[valid.values] = p_adj_vals
+    df_res["p_value_adj"] = p_adj
+    df_res["-log10(p)"] = -np.log10(df_res["p_value"] + 1e-300)
+    df_res["-log10(p_adj)"] = -np.log10(df_res["p_value_adj"] + 1e-300)
+
+    return df_res.sort_values("-log10(p_adj)", ascending=False)
 
 
 
@@ -715,7 +745,7 @@ def plot_mwu_distribution(df_mwu, top_n=None, figsize=(10,6), save_path=None):
         df_plot = df_plot.head(top_n)
     
     plt.figure(figsize=figsize)
-    sns.barplot(x="-log10(p)", y="marker", data=df_plot, color="steelblue")
+    sns.barplot(x="-log10(p)", y="marker", data=df_plot, color=_AFTER_COLOR)
 
     plt.xlabel("-log10(p-value)", fontsize=13, fontweight='bold')
     plt.ylabel("Marker", fontsize=13, fontweight='bold')
@@ -730,11 +760,11 @@ def plot_mwu_distribution(df_mwu, top_n=None, figsize=(10,6), save_path=None):
     plt.tight_layout()
     
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        _savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"  [SAVE] MWU plot saved to: {save_path}")
     else:
         plt.show()
-    
+
     plt.close()
 
 # Calculate the KL divergence before and after correction for each marker across plates
@@ -751,12 +781,17 @@ def calculate_kd(df_before, df_after, panel, exclude_cols=None, n_bins=100, ctx=
     df_before = df_before[df_before['panel'] == panel].dropna(axis=1, how="all").copy()
     df_after = df_after[df_after['panel'] == panel].dropna(axis=1, how="all").copy()
     
-    # Select markers
-    markers = [c for c in df_before.columns if c not in exclude_cols and c in df_after.columns]
-    
+    # Select markers — restrict to true_markers when available to exclude
+    # OmiqFilter-derived gate columns (cells, Unfiltered, alive, CD45low, etc.)
+    all_cols = [c for c in df_before.columns if c not in exclude_cols and c in df_after.columns]
+    if ctx is not None and getattr(ctx, "true_markers", None):
+        markers = [m for m in all_cols if m in ctx.true_markers]
+    else:
+        markers = all_cols
+
     # Ensure markers are numeric and drop non-numeric ones
     markers = [m for m in markers if pd.api.types.is_numeric_dtype(df_before[m])]
-    
+
     results = []
 
     for marker in markers:
@@ -801,7 +836,7 @@ def plot_kd_distribution(df_kd, top_n=None, figsize=None, save_path=None):
     
     plt.figure(figsize=figsize)
     # Norml width of bars
-    sns.barplot(x="KD", y="marker", data=df_plot, color="steelblue", width=0.6)
+    sns.barplot(x="KD", y="marker", data=df_plot, color=_AFTER_COLOR, width=0.6)
 
     plt.xlabel("KL Divergence (KD)", fontsize=14, fontweight='bold')
     plt.ylabel("Marker", fontsize=14, fontweight='bold')
@@ -821,12 +856,102 @@ def plot_kd_distribution(df_kd, top_n=None, figsize=None, save_path=None):
     
     plt.tight_layout()
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        _savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"  [SAVED] KD distribution plot -> {save_path}")
     else:
         plt.show()
 
     plt.close()
+
+
+def plot_kd_with_pvalue(
+    kd_df,
+    mwu_df,
+    top_n=None,
+    figsize=None,
+    save_path=None,
+):
+    """
+    Side-by-side bar chart combining KL divergence and -log10(MWU p-value) per marker.
+
+    Markers are sorted by KD (descending). The right panel uses colour to
+    distinguish significant (_BEFORE_COLOR, FDR < 0.05) from non-significant (_AFTER_COLOR) markers
+    and draws a dashed significance threshold line.
+
+    Args:
+        kd_df  (pd.DataFrame): Output of calculate_kd  — columns ['marker', 'KD'].
+        mwu_df (pd.DataFrame): Output of calculate_mwu — columns ['marker', '-log10(p)', 'p_value'].
+        top_n  (int, optional): Restrict to the top_n markers by KD.
+        figsize (tuple, optional): Figure size; auto-sized when None.
+        save_path (str, optional): File path to save the figure; shows inline when None.
+    """
+    # Prefer adjusted p-values when available
+    p_col    = "p_value_adj" if "p_value_adj" in mwu_df.columns else "p_value"
+    logp_col = "-log10(p_adj)" if "-log10(p_adj)" in mwu_df.columns else "-log10(p)"
+
+    # Merge on marker, sort by KD
+    df = kd_df[["marker", "KD"]].merge(
+        mwu_df[["marker", logp_col, p_col]], on="marker", how="inner"
+    ).sort_values("KD", ascending=False)
+
+    if top_n is not None:
+        df = df.head(top_n)
+
+    n = len(df)
+    if figsize is None:
+        height = max(6, n * 0.28)
+        figsize = (14, height)
+
+    sig_threshold = -np.log10(0.05)  # ≈ 1.30
+    kd_threshold  = 0.01
+
+    colors_pval = [_BEFORE_COLOR if p < 0.05 else _AFTER_COLOR for p in df[p_col]]
+
+    fig, (ax_kd, ax_pv) = plt.subplots(1, 2, figsize=figsize, sharey=True)
+
+    # ── Left: KD ──────────────────────────────────────────────────────────────
+    ax_kd.barh(df["marker"], df["KD"], color=_AFTER_COLOR, height=0.7)
+    ax_kd.axvline(kd_threshold, color="red", linestyle="--", linewidth=1.8,
+                  label=f"KD = {kd_threshold}")
+    ax_kd.set_xlabel("KL Divergence (KD)", fontsize=13, fontweight="bold")
+    ax_kd.set_title("KL Divergence\n(before vs after)", fontsize=14, fontweight="bold")
+    ax_kd.invert_yaxis()
+    ax_kd.tick_params(axis="both", labelsize=10)
+    max_kd = df["KD"].max()
+    ax_kd.set_xlim(0, max(kd_threshold * 1.5, max_kd * 1.1))
+    ax_kd.legend(fontsize=11, loc="lower right")
+
+    # ── Right: -log10(p_adj) ──────────────────────────────────────────────────
+    ax_pv.barh(df["marker"], df[logp_col], color=colors_pval, height=0.7)
+    ax_pv.axvline(sig_threshold, color="red", linestyle="--", linewidth=1.8,
+                  label="FDR = 0.05")
+    ax_pv.set_xlabel("-log₁₀(p_adj)  [MWU, FDR-corrected]", fontsize=13, fontweight="bold")
+    ax_pv.set_title("-log₁₀(p_adj)\n(MWU + BH correction, before vs after)", fontsize=14, fontweight="bold")
+    ax_pv.tick_params(axis="both", labelsize=10)
+    max_logp = df[logp_col].replace([np.inf], np.nan).dropna().max()
+    ax_pv.set_xlim(0, max(sig_threshold * 2, max_logp * 1.05) if not np.isnan(max_logp) else sig_threshold * 3)
+    from matplotlib.patches import Patch
+    ax_pv.legend(
+        handles=[
+            Patch(color=_BEFORE_COLOR, label="FDR < 0.05 (significant)"),
+            Patch(color=_AFTER_COLOR, label="FDR ≥ 0.05"),
+            plt.Line2D([0], [0], color="red", linestyle="--", linewidth=1.8, label="FDR = 0.05"),
+        ],
+        fontsize=10, loc="lower right",
+    )
+
+    fig.suptitle(
+        "Distribution shift before vs after Time Correction",
+        fontsize=16, fontweight="bold", y=1.01,
+    )
+    plt.tight_layout()
+
+    if save_path:
+        _savefig(save_path, fig=fig, dpi=300, bbox_inches="tight")
+        print(f"  [SAVE] KD+p-value plot saved to: {save_path}")
+    else:
+        plt.show()
+    plt.close(fig)
 
 
 def preprocess_files(
@@ -922,7 +1047,7 @@ def load_and_preprocess_panel_time(panel_name, dataset_to_process, ctx, verbose=
         df = read_cytof_file(f)
         
         # If cell_type already exists, assumed to be pre-processed; skip markers harmonization and schema
-        if "cell_type" not in df.columns:
+        if "celltypes" not in df.columns:
             df.columns = [harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter","") for c in df.columns]
             df = apply_marker_schema(df, ctx)
             df = assign_cell_type(df, ctx)
@@ -956,8 +1081,8 @@ def load_and_preprocess_panel_time(panel_name, dataset_to_process, ctx, verbose=
         # Always use add_metadata for consistent mapping
         df = add_metadata(df, f, metadata_df=metadata_df)
         
-        # Ensure cell_type exists (as these are processed files)
-        if "cell_type" not in df.columns:
+        # Ensure celltypes exists (as these are processed files)
+        if "celltypes" not in df.columns:
             # Fallback if somehow not present
             df = assign_cell_type(df, ctx)
             

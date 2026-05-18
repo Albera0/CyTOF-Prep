@@ -1,6 +1,10 @@
 import os
+import sys
+import json
 import matplotlib
-matplotlib.use('Agg')
+# Force non-interactive backend only when running as a plain script, not in Jupyter
+if 'ipykernel' not in sys.modules:
+    matplotlib.use('Agg')
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,6 +20,41 @@ from .correction import *
 from .time_correction_visualization import *
 from .batch_correction_visualization import *
 
+
+def _load_pheno_markers(project_root, dataset, panel, available_cols):
+    """
+    Look for pheno_markers in study config JSONs saved under results/.
+    Searches for any JSON under results/ whose cytof_config.pheno_markers (or top-level
+    pheno_markers) is set and whose filename references the given dataset and panel.
+    Falls back to None if nothing is found.
+    """
+    results_dir = os.path.join(project_root, "results")
+    if not os.path.isdir(results_dir):
+        return None
+
+    # Collect candidate JSONs: prefer ones whose name contains the dataset (and panel)
+    candidates = glob(os.path.join(results_dir, "**", "study_config_*.json"), recursive=True)
+    # Sort so dataset+panel-specific files come before more generic ones
+    def _score(p):
+        name = os.path.basename(p).lower()
+        return (dataset.lower() not in name, panel.lower() not in name)
+    candidates = sorted(candidates, key=_score)
+
+    for cfg_path in candidates:
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            pheno = (cfg.get("cytof_config", {}).get("pheno_markers")
+                     or cfg.get("pheno_markers"))
+            if pheno:
+                filtered = [m for m in pheno if m in available_cols]
+                if filtered:
+                    print(f"  [UMAP] pheno_markers loaded from {os.path.basename(cfg_path)}: {filtered}")
+                    return filtered
+        except Exception:
+            continue
+    return None
+
 import warnings
 warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -23,7 +62,245 @@ warnings.filterwarnings("ignore", message=".*dtype argument will be deprecated.*
 warnings.filterwarnings("ignore", message="No data for colormapping provided via 'c'")
 warnings.filterwarnings("ignore", message="Tight layout not applied")
 
-def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=None):
+def load_data_from_omiq(data_dir, metadata_df, ctx, dataset=None, panel=None, celltype_col=None):
+    """
+    Load CyTOF files exported from OMIQ and return an annotated cell matrix.
+
+    Reads all CSV/FCS files in data_dir, matches each file against metadata_df to
+    determine sample_name, plate, dataset, panel, and any other ctx.meta_cols columns.
+    Harmonizes marker names, applies the marker schema, assigns cell types, and
+    concatenates everything into a single DataFrame with one row per cell.
+
+    Args:
+        data_dir (str): Directory containing CSV or FCS files exported from OMIQ.
+        metadata_df (pd.DataFrame): Metadata table with at minimum: file_name,
+            sample_name, plate, dataset, panel. Any extra columns listed in
+            ctx.meta_cols are also propagated to the output matrix.
+        ctx (CyTOFContext): Pipeline configuration context.
+        dataset (str, optional): If provided, only files whose metadata row has
+            this dataset value are loaded (e.g. 'D0').
+        panel (str, optional): If provided, only files whose metadata row has
+            this panel value are loaded.
+        celltype_col (str, optional): Name of the column in the input CSV that
+            contains cell type labels (e.g. 'Population' or 'celltypes'). When
+            provided, that column is renamed to 'celltypes' and used directly,
+            skipping the OmiqFilter-based gating assignment. If None, cell types
+            are derived from ctx.celltype_gating binary flag columns.
+
+    Returns:
+        tuple[pd.DataFrame, list[str]]: (matrix, markers) where matrix is the
+            full annotated cell DataFrame and markers is the list of biological
+            marker column names used for batch correction.
+    """
+    dfs = []
+    markers = None
+    n_skipped = 0
+
+    for f in glob(os.path.join(data_dir, "*")):
+        if not f.lower().endswith(('.csv', '.fcs')):
+            continue
+        file_name = os.path.basename(f)
+
+        match = metadata_df[metadata_df["file_name"] == file_name]
+        if match.empty:
+            name_no_ext = os.path.splitext(file_name)[0]
+            match = metadata_df[metadata_df["file_name"] == name_no_ext]
+
+        if match.empty:
+            print(f"[WARN] Skipping file not in metadata: {file_name}")
+            n_skipped += 1
+            continue
+
+        row = match.iloc[0]
+        file_dataset = str(row.get("dataset", ""))
+        file_panel = str(row.get("panel", ""))
+
+        if dataset is not None and file_dataset != dataset:
+            continue
+        if panel is not None and file_panel != panel:
+            continue
+
+        df = read_cytof_file(f)
+
+        # --- Cell type annotation (BEFORE harmonization) ---
+        # Must happen first because harmonization strips "OmiqFilter" from column names.
+        cell_type_series = None
+        # Case 1: user provided the exact column name (e.g. a single "OmiqFilter" string column)
+        if celltype_col is not None and celltype_col in df.columns:
+            cell_type_series = df[celltype_col].reset_index(drop=True)
+            print(f"  [CT] column '{celltype_col}' → values: {cell_type_series.dropna().unique()[:5]}")
+            df["celltypes"] = cell_type_series.values
+        # Case 2: auto-detect multiple OmiqFilter<gate> binary flag columns.
+        # Restrict to gates listed in ctx.celltype_gating so broad hierarchical gates
+        # (e.g. OmiqFilteralive, OmiqFilterbulk_leukocytes) are never assigned instead
+        # of the specific cell-type gates the user cares about.
+        elif any(c.startswith("OmiqFilter") for c in df.columns):
+            _allowed = set(ctx.celltype_gating) if ctx.celltype_gating else None
+            gate_cols = {
+                c.replace("OmiqFilter", ""): c
+                for c in df.columns
+                if c.startswith("OmiqFilter")
+                and (_allowed is None or c.replace("OmiqFilter", "") in _allowed)
+            }
+            print(f"  [CT] auto-detected {len(gate_cols)} OmiqFilter gate columns: {list(gate_cols.keys())[:5]}")
+            def _is_positive(val):
+                if val is None:
+                    return False
+                if isinstance(val, bool):
+                    return val
+                try:
+                    return float(val) > 0
+                except (ValueError, TypeError):
+                    return str(val).strip().lower() == "true"
+            def _get_type(row):
+                for name, col in gate_cols.items():
+                    if _is_positive(row.get(col)):
+                        return name
+                return None
+            cell_type_series = df.apply(_get_type, axis=1).reset_index(drop=True)
+            n_assigned = cell_type_series.notna().sum()
+            print(f"  [CT] {n_assigned}/{len(df)} cells assigned a cell type")
+        elif celltype_col is not None:
+            avail = [c for c in df.columns if "omiq" in c.lower() or "gate" in c.lower() or "filter" in c.lower()]
+            print(f"  [WARN] celltype_col='{celltype_col}' not found. Possible gate columns: {avail[:10]}")
+
+        # --- Harmonize marker names (strips OmiqFilter prefix from remaining cols) ---
+        df.columns = [
+            harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter", "")
+            for c in df.columns
+        ]
+        df = df.reset_index(drop=True)
+        df = apply_marker_schema(df, ctx)
+
+        # Attach cell_type — never filters or drops any rows
+        if cell_type_series is not None:
+            df["celltypes"] = cell_type_series.values
+
+        df, file_markers = enforce_schema(df, ctx)
+        df = add_metadata(df, f, metadata_df=metadata_df, ctx=ctx)
+
+        # Accumulate markers across files so multi-panel loads capture all markers.
+        if markers is None:
+            markers = list(file_markers)
+        else:
+            for _m in file_markers:
+                if _m not in markers:
+                    markers.append(_m)
+
+        dfs.append(df)
+        print(f"[LOAD] {file_name} | n_cells={len(df)}")
+
+    if not dfs:
+        raise ValueError(
+            f"No files loaded from {data_dir!r}. Check data_dir and metadata_df."
+        )
+
+    matrix = pd.concat(dfs, ignore_index=True)
+    print(f"\n[LOAD] Total: {len(matrix)} cells from {len(dfs)} files ({n_skipped} skipped)")
+    return matrix, markers or []
+
+
+def apply_correction(df, markers, anchor_name, ctx):
+    """
+    Apply time drift correction and batch correction to an annotated CyTOF matrix.
+
+    Stages (identical to run_cytof_correction):
+    1. Cell-type-specific time drift correction (stable-marker rolling-median slope).
+    2. Arcsinh transformation (cofactor = 5) on biological markers only.
+    3. Quantile-based batch correction (anchor-sample alignment to reference plate).
+
+    Args:
+        df (pd.DataFrame): Annotated cell matrix from load_data_from_omiq.
+            Must contain 'panel', 'plate', 'sample_name', 'dataset', 'celltypes'.
+        markers (list[str]): Biological marker column names (from load_data_from_omiq).
+            Only these are used for batch correction (gate/flag columns excluded).
+        anchor_name (str): 'sample_name' value of the inter-plate anchor sample.
+        ctx (CyTOFContext): Pipeline config (ref_plate, meta_cols, celltype2correct…).
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame]:
+            (intermediate, corrected)
+            - intermediate : time-corrected + arcsinh, BEFORE batch correction.
+                             Use as "After" in time-correction visualization, and
+                             as the saved pre-batch baseline for diagnostics.
+            - corrected    : fully corrected (time + arcsinh + batch).
+    """
+    corrected_panels = []
+    intermediate_panels = []
+
+    # Columns that are OmiqFilter-derived binary flags or gate labels — must not be
+    # arcsinh-transformed (they are 0/1 integers, not continuous signal).
+    gate_cols = set()
+    if getattr(ctx, 'celltypes', None):
+        gate_cols.update(ctx.celltypes)
+    if getattr(ctx, 'celltype_gating', None):
+        gate_cols.update(ctx.celltype_gating)
+    _non_signal = set(ctx.meta_cols) | {"celltypes"} | gate_cols
+
+    # Determine unique (dataset, panel) groups
+    dataset_col_present = "dataset" in df.columns
+    group_keys_list = (
+        df[["dataset", "panel"]].drop_duplicates().values.tolist()
+        if dataset_col_present
+        else [[None, p] for p in df["panel"].unique()]
+    )
+
+    for dataset, panel in group_keys_list:
+        if dataset is not None:
+            df_group = df[(df["dataset"] == dataset) & (df["panel"] == panel)].copy()
+        else:
+            df_group = df[df["panel"] == panel].copy()
+            dataset = ""
+
+        # Restrict batch-correction markers to those present in this panel's data.
+        # Biological markers only — gate columns are excluded via the markers list
+        # (which comes from load_data_from_omiq / enforce_schema).
+        valid_markers = [m for m in markers if m in df_group.columns]
+        if len(valid_markers) < len(markers):
+            missing = set(markers) - set(valid_markers)
+            print(f"[WARN] {len(missing)} marker(s) absent from panel '{panel}' and skipped: "
+                  f"{sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}")
+
+        # ── Step 1: Cell-type-specific time drift correction ─────────────────
+        # Gate/flag columns are NOT corrected (handled inside time_correction).
+        df_group = time_correction(df_group, panel, ctx)
+
+        # ── Step 2: Arcsinh transformation ───────────────────────────────────
+        # Applied only to continuous signal columns; gate columns are excluded.
+        all_data_cols = [c for c in df_group.columns if c not in _non_signal]
+        df_group = arcsinh(df_group, all_data_cols)
+
+        # Capture time-corrected + arcsinh state (before batch correction).
+        intermediate_panels.append(df_group.copy())
+
+        # ── Step 3: Batch correction ──────────────────────────────────────────
+        ref_stats = build_reference_stats(df_group, valid_markers, anchor_name, dataset, panel, ctx)
+
+        corrected_plates = []
+        for plate, df_plate in df_group.groupby("plate"):
+            if plate == ctx.ref_plate:
+                # Reference plate: time + arcsinh only, no quantile alignment needed.
+                corrected_plates.append(df_plate)
+                continue
+
+            df_anchor = df_plate[df_plate["sample_name"] == anchor_name]
+            if df_anchor.empty or not ref_stats:
+                reason = "no anchor in plate" if df_anchor.empty else "no ref stats"
+                print(f"[SKIP-BATCH] plate={plate} ({reason}) — keeping time-corrected values.")
+                corrected_plates.append(df_plate)
+            else:
+                corrected_plates.append(
+                    batch_correct_plate(df_plate, valid_markers, ref_stats, anchor_name)
+                )
+
+        corrected_panels.append(pd.concat(corrected_plates, ignore_index=True))
+
+    intermediate = pd.concat(intermediate_panels, ignore_index=True)
+    corrected    = pd.concat(corrected_panels,    ignore_index=True)
+    return intermediate, corrected
+
+
+def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=None, config_dict=None, metadata_df=None):
     """
     Main entry point for the sequential CyTOF normalization pipeline.
 
@@ -39,27 +316,34 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
         dataset_to_process (str): ID of the dataset to run (e.g., 'D0').
         config_path (str, optional): Custom path to meta.json.
         metadata_path (str, optional): Custom path to SampleSheet.csv.
+        config_dict (dict, optional): Custom configuration dictionary.
+        metadata_df (pd.DataFrame, optional): Custom metadata DataFrame.
     """
 
     # Create CyTOFContext from configuration
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
-    if config_path is None:
-        config_path = os.path.join(project_root, "metadata", "meta.json")
-    
-    config = get_config(config_path=config_path)
+    if config_dict is not None:
+        config = get_config(config_dict=config_dict)
+    else:
+        if config_path is None:
+            config_path = os.path.join(project_root, "metadata", "meta.json")
+        config = get_config(config_path=config_path)
+        
     ctx = CyTOFContext(config)
 
     # ===== STEP 0: LOADING METADATA =====
-    if metadata_path is None:
-        metadata_path = os.path.join(project_root, "metadata", "metadata.xlsx")
-
-    metadata_df = None
-    if metadata_path is not None and os.path.exists(metadata_path):
+    if metadata_df is not None:
         print("\n===== STEP 0: LOADING METADATA =====")
-        metadata_df = pd.read_excel(metadata_path)
     else:
-        print(f"[WARN] Metadata file not found at {metadata_path}.")
+        if metadata_path is None:
+            metadata_path = os.path.join(project_root, "metadata", "metadata.xlsx")
+
+        if metadata_path is not None and os.path.exists(metadata_path):
+            print("\n===== STEP 0: LOADING METADATA =====")
+            metadata_df = pd.read_excel(metadata_path)
+        else:
+            print(f"[WARN] Metadata file not found at {metadata_path}.")
 
     # Index files by (dataset, panel, plate)
     file_index = defaultdict(list)
@@ -100,14 +384,16 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
         dfs = []
         for f in files:
             df = read_cytof_file(f)
-            # If cell_type already exists, assumed to be pre-processed
-            if "cell_type" not in df.columns:
+            # If celltypes already exists, assumed to be pre-processed
+            if "celltypes" not in df.columns:
                 df.columns = [harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter","") for c in df.columns]
                 df = apply_marker_schema(df, ctx)
                 df = assign_cell_type(df, ctx)
                 df, markers = enforce_schema(df, ctx)
             else:
-                markers = [c for c in df.columns if c not in ctx.meta_cols]
+                df.columns = [harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter","") for c in df.columns]
+                df = apply_marker_schema(df, ctx)
+                df, markers = enforce_schema(df, ctx)
 
             df = add_metadata(df, f, metadata_df=metadata_df, ctx=ctx)
             dfs.append(df)
@@ -137,14 +423,14 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
         dfs = []
         for f in files:
             df = read_cytof_file(f)
-            # If cell_type already exists, assumed to be pre-processed
-            if "cell_type" not in df.columns:
+            # If celltypes already exists, assumed to be pre-processed
+            if "celltypes" not in df.columns:
                 df.columns = [harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter","") for c in df.columns]
                 df = apply_marker_schema(df, ctx)
                 df = assign_cell_type(df, ctx)
                 df, markers = enforce_schema(df, ctx)
             else:
-                markers = [c for c in df.columns if c not in ctx.meta_cols]
+                markers = [c for c in df.columns if c not in ctx.meta_cols and c != "celltypes"]
 
             df = add_metadata(df, f, metadata_df=metadata_df, ctx=ctx)
             dfs.append(df)
@@ -186,8 +472,9 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
             ref_stats = ref_stats_dict.get((dataset, panel), None)
             anchor_sample = ctx.anchors.get(dataset)
             df_anchor = df_plate[df_plate["sample_name"] == anchor_sample] if anchor_sample else pd.DataFrame()
-            if df_anchor.empty:
-                print(f"[SKIP-BATCH] No anchor in {dataset}|{panel}|{plate} | using uncorrected data")
+            if df_anchor.empty or not ref_stats:
+                reason = "no anchor" if df_anchor.empty else "no ref stats"
+                print(f"[SKIP-BATCH] No anchor in {dataset}|{panel}|{plate} ({reason}) | using uncorrected data")
                 df_corrected = df_plate
                 skip_flag = "_UNCORRECTED"
             else:
@@ -213,21 +500,23 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
 
 
 # For reference, here is the time_correction visualization function
-def run_time_analysis(datasets=None, plates_to_visualize=None, verbose=True):
+def run_time_analysis(datasets=None, plates_to_visualize=None, verbose=True, config_path=None):
     """
     Executes the diagnostic pipeline for evaluating time-drift correction.
 
-    Generates visualizations to assess whether signal drift within acquisition 
+    Generates visualizations to assess whether signal drift within acquisition
     runs has been successfully removed without distorting biology.
 
     Args:
         datasets (list/str, optional): Names of datasets to analyze.
         plates_to_visualize (list, optional): Specific plates to focus on.
         verbose (bool): Whether to print progress details.
+        config_path (str, optional): Path to meta.json; defaults to metadata/meta.json.
     """
     # Create CyTOFContext from configuration
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    config_path = os.path.join(project_root, "metadata", "meta.json")
+    if config_path is None:
+        config_path = os.path.join(project_root, "metadata", "meta.json")
     config = get_config(config_path=config_path)
     ctx = CyTOFContext(config)
 
@@ -294,7 +583,7 @@ def run_time_analysis(datasets=None, plates_to_visualize=None, verbose=True):
             # 2. PCA Variance Analysis
             print(f"[ANALYZE] Running variation_pca...")
             # Use columns that actually exist in the data
-            factors = [c for c in ["plate", "sample_name", "cell_type", "Time"] if c in df_b.columns]
+            factors = [c for c in ["plate", "sample_name", "celltypes", "Time"] if c in df_b.columns]
             var_b = variation_pca(df_b, markers=markers, group_col="condition", info_cols=factors, panel=panel)
             var_a = variation_pca(df_a, markers=markers, group_col="condition", info_cols=factors, panel=panel)
             all_variance_results[(dataset, panel)] = {"before": var_b, "after": var_a}
@@ -303,20 +592,30 @@ def run_time_analysis(datasets=None, plates_to_visualize=None, verbose=True):
             var_a.to_csv(os.path.join(path_Variance, f"variance_after_{dataset}_{panel}.csv"))
 
             # 2.2 Marker-level Variance Boxplots (Time Correction)
+            # Group by sample_name so each group is one run; Time is the only factor.
+            # This isolates within-sample time drift — the signal time correction actually removes.
             print(f"[ANALYZE] Generating Marker-level variance boxplots (Time)...")
-            mvar_b = variation_marker(df_b, markers=markers, group_col=None, info_cols=factors, panel=panel)
-            mvar_a = variation_marker(df_a, markers=markers, group_col=None, info_cols=factors, panel=panel)
-            
+            mvar_b = variation_marker(df_b, markers=markers, group_col='sample_name', info_cols=['Time'], panel=panel)
+            mvar_a = variation_marker(df_a, markers=markers, group_col='sample_name', info_cols=['Time'], panel=panel)
+
             # Save the raw marker-level variance data to CSV
             mvar_b.to_csv(os.path.join(path_Variance, f"variance_marker_raw_before_{dataset}_{panel}_Time.csv"), index=False)
             mvar_a.to_csv(os.path.join(path_Variance, f"variance_marker_raw_after_{dataset}_{panel}_Time.csv"), index=False)
-            
-            plot_variance_marker_boxplot(mvar_b, mvar_a, save_path=os.path.join(path_Variance, f"variance_marker_boxplot_{dataset}_{panel}_Time.png"), use_log=True)
+
+            plot_variance_marker_boxplot(mvar_b, mvar_a, save_path=os.path.join(path_Variance, f"variance_marker_boxplot_{dataset}_{panel}_Time.png"), use_log=False)
 
             # 3. UMAP
             print(f"[ANALYZE] Generating UMAP...")
-            adata = umap_by_celltype(df_b, df_a, panel=panel, markers=markers, celltype_col="cell_type", subsample=50000)
-            plt.savefig(os.path.join(path_UMAP, f"umap_comparison_{dataset}_{panel}_TimeCorrection.png"), dpi=300, bbox_inches='tight')
+            # Resolve phenotypic markers for UMAP
+            umap_markers_time = None
+            if ctx.pheno_markers:
+                umap_markers_time = [m for m in ctx.pheno_markers if m in df_b.columns]
+            if not umap_markers_time:
+                umap_markers_time = _load_pheno_markers(project_root, dataset, panel, df_b.columns)
+            if not umap_markers_time:
+                umap_markers_time = markers
+            adata = umap_by_celltype(df_b, df_a, panel=panel, markers=umap_markers_time, celltype_col="celltypes", subsample=50000)
+            _savefig(os.path.join(path_UMAP, f"umap_comparison_{dataset}_{panel}_TimeCorrection.png"), dpi=300, bbox_inches='tight')
             plt.close()
 
             # 4. Shared Markers (Reference)
@@ -408,14 +707,21 @@ def run_time_analysis(datasets=None, plates_to_visualize=None, verbose=True):
 
 
 # For reference, here is the batch_correction visualization function
-def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000):
+def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000, config_path=None):
     """
     Main entry point for batch processing - Batch Correction Visualization.
     Visualizes [Time-corrected + arcsinh] vs [Batch-corrected].
+
+    Args:
+        datasets (list/str, optional): Names of datasets to analyze.
+        verbose (bool): Whether to print progress details.
+        subsample_umap (int): Max cells for UMAP subsampling.
+        config_path (str, optional): Path to meta.json; defaults to metadata/meta.json.
     """
     # Create CyTOFContext from configuration if not provided
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    config_path = os.path.join(project_root, "metadata", "meta.json")
+    if config_path is None:
+        config_path = os.path.join(project_root, "metadata", "meta.json")
     config = get_config(config_path=config_path)
     ctx = CyTOFContext(config)
 
@@ -456,6 +762,7 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000):
     # Store data for cross-panel shared marker analysis
     all_dfs = {}
     all_markers = {}
+    all_umap_markers = {}   # pheno_markers-filtered, used for all UMAPs including cross-panel
 
     print(f"\n{'='*60}")
     print(f"STARTING BATCH CORRECTION ANALYSIS")
@@ -493,7 +800,7 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000):
             # 2. PCA Variance Analysis
             print(f"[ANALYZE] Running variation_pca...")
             # Use columns that actually exist in the data to avoid KeyError
-            factors = [c for c in ["plate", "sample_name", "cell_type", "Time"] if c in df_b.columns]
+            factors = [c for c in ["plate", "sample_name", "celltypes", "Time"] if c in df_b.columns]
             
             # Use only true_markers for marker analysis if provided
             analysis_markers = [m for m in markers if m in ctx.true_markers] if ctx.true_markers else markers
@@ -532,7 +839,7 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000):
                     markers=analysis_markers, 
                     df_before=df_b, 
                     batch_key='plate', 
-                    label_key='cell_type', 
+                    label_key='celltypes', 
                     subsample=10000, 
                     n_iterations=20
                 )
@@ -555,27 +862,37 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000):
 
             # 4. UMAP Evaluatons
             print(f"[ANALYZE] Generating UMAPs...")
+            # Resolve phenotypic markers: ctx > study config JSON > all analysis_markers
+            umap_markers = None
+            if ctx.pheno_markers:
+                umap_markers = [m for m in ctx.pheno_markers if m in df_b.columns]
+            if not umap_markers:
+                umap_markers = _load_pheno_markers(project_root, dataset, panel, df_b.columns)
+            if not umap_markers:
+                umap_markers = analysis_markers
+            all_umap_markers[(dataset, panel)] = umap_markers
+
             # Plate effect
-            umap_plate_effect(df_b, df_a, markers=analysis_markers, subsample=subsample_umap, 
+            umap_plate_effect(df_b, df_a, markers=umap_markers, subsample=subsample_umap,
                                 save_path=os.path.join(path_UMAP, f"umap_plate_effect_{dataset}_{panel}_Batch.png"))
-            
+
             # Batch Evaluation
-            umap_batch_evaluation(df_raw=df_b, df_corrected=df_a, markers=analysis_markers, 
+            umap_batch_evaluation(df_raw=df_b, df_corrected=df_a, markers=umap_markers,
                                     save_path=os.path.join(path_UMAP, f"umap_batch_evaluation_{dataset}_{panel}_Batch.png"),
                                     true_markers=ctx.true_markers)
-            
+
             # Celltype by Plate
-            umap_celltype_by_plate(df_raw=df_b, df_corrected=df_a, markers=analysis_markers, subsample=subsample_umap, 
+            umap_celltype_by_plate(df_raw=df_b, df_corrected=df_a, markers=umap_markers, subsample=subsample_umap,
                                     save_path=os.path.join(path_UMAP, f"umap_celltype_by_plate_{dataset}_{panel}_Batch.png"))
 
             # Marker Expression UMAP
-            umap_marker_expression(df_b, df_a, analysis_markers, panel, 
+            umap_marker_expression(df_b, df_a, umap_markers, panel,
                                     save_path=os.path.join(path_UMAP, f"umap_marker_expression_{dataset}_{panel}_Batch.png"))
 
             # 5. EMD and MAD
             print(f"[ANALYZE] Computing EMD/MAD...")
-            # If 'cell_type' exists, pass it to use biological clusters instead of SOM
-            cluster_param = 'cell_type' if 'cell_type' in df_b.columns else None
+            # If 'celltypes' exists, pass it to use biological clusters instead of SOM
+            cluster_param = 'celltypes' if 'celltypes' in df_b.columns else None
             emd_df, _, mad_score = compute_emd_mad(
                 df_raw=df_b, 
                 df_corr=df_a, 
@@ -827,8 +1144,8 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000):
                         all_dfs[p1_key]["before"], all_dfs[p1_key]["after"],
                         df_raw_P2=all_dfs[p2_key]["before"] if p2_key else None,
                         df_corrected_P2=all_dfs[p2_key]["after"] if p2_key else None,
-                        markers_P1=all_markers[p1_key],
-                        markers_P2=all_markers[p2_key] if p2_key else None,
+                        markers_P1=all_umap_markers.get(p1_key, all_markers[p1_key]),
+                        markers_P2=all_umap_markers.get(p2_key, all_markers[p2_key]) if p2_key else None,
                         save_dir=path_shared_comp
                     )
                 else:
@@ -863,14 +1180,14 @@ if __name__ == "__main__":
 
     if args.step == "correction" or args.step == "all":
         print(f"\n>>> Running [Correction] for {args.dataset}...")
-        run_cytof_correction(dataset_to_process=args.dataset)
+        run_cytof_correction(dataset_to_process=args.dataset, config_path=args.config)
 
     if args.step == "time-analysis" or args.step == "all":
         print(f"\n>>> Running [Time Analysis] for {args.dataset}...")
-        run_time_analysis(datasets=[args.dataset])
+        run_time_analysis(datasets=[args.dataset], config_path=args.config)
 
     if args.step == "batch-analysis" or args.step == "all":
         print(f"\n>>> Running [Batch Analysis] for {args.dataset}...")
-        run_batch_analysis(datasets=[args.dataset])
+        run_batch_analysis(datasets=[args.dataset], config_path=args.config)
 
     print("\n[FINISH] Operation completed successfully.")

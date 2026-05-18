@@ -27,8 +27,48 @@ from statsmodels.stats.multitest import multipletests
 import scib
 from sklearn.neighbors import NearestNeighbors
 
+from pypalettes import load_cmap as _load_cmap
+
 from .utils import add_metadata, enforce_schema, read_cytof_file, get_indexed_files, harmonize_marker, apply_marker_schema
 from .correction import arcsinh
+
+_BEFORE_COLOR = "#F56455"
+_AFTER_COLOR  = "#15134B"
+_PANEL1_COLOR = "#A1B654"
+_PANEL2_COLOR = "#B8321A"
+
+_PLATE_COLORS = [
+    "#2B9B81", "#F4C40F", "#FBE183", "#D8443C", "#9B3441",
+    "#DE597C", "#1F6E9C", "#E87B89", "#E6A2A6", "#AA7AA1",
+    "#9F5691", "#633372", "#92C051", "#FE9B00", "#FBE183",
+]
+
+
+def _savefig(save_path, fig=None, **kwargs):
+    """Save figure as PNG and SVG."""
+    _fig = fig if fig is not None else plt.gcf()
+    _fig.savefig(save_path, **kwargs)
+    svg_path = os.path.splitext(save_path)[0] + '.svg'
+    svg_kw = {k: v for k, v in kwargs.items() if k != 'dpi'}
+    svg_kw.setdefault('bbox_inches', 'tight')
+    _fig.savefig(svg_path, **svg_kw)
+
+
+def _build_celltype_palette(cell_types):
+    """Return {celltype: rgba} using Alexandrite, sorted alphabetically."""
+    sorted_types = sorted(str(ct) for ct in cell_types)
+    n = len(sorted_types)
+    if n == 0:
+        return {}
+    cmap = _load_cmap("Alexandrite")
+    return {ct: cmap(i / max(n - 1, 1)) for i, ct in enumerate(sorted_types)}
+
+
+def _build_plate_palette(plates):
+    """Assign _PLATE_COLORS to plates in sorted order."""
+    sorted_plates = sorted(str(p) for p in plates)
+    return {p: _PLATE_COLORS[i % len(_PLATE_COLORS)] for i, p in enumerate(sorted_plates)}
+
 
 # Visualize the distribution of marker intensities across plates for Anchor samples only
 def visualize_anchor_across_plates(
@@ -164,14 +204,9 @@ def visualize_anchor_across_plates(
         plt.tight_layout(rect=[0, 0, 1, 0.95])
 
         if save_dir is not None:
-            save_path = os.path.join(
-                save_dir,
-                f"{panel}_Anchor_{marker}.png"
-            )
-
-            fig.savefig(save_path, dpi=300)
+            save_path = os.path.join(save_dir, f"{panel}_Anchor_{marker}.png")
+            _savefig(save_path, fig=fig, dpi=300)
             plt.close(fig)
-
             print(f"Saved: {save_path}")
         else:
             plt.show()
@@ -307,14 +342,9 @@ def visualize_anchor_celltype_across_plates(
         plt.tight_layout(rect=[0, 0, 1, 0.95])
 
         if save_dir is not None:
-            save_path = os.path.join(
-                save_dir,
-                f"{panel}_Anchor_Celltype_{marker}.png"
-            )
-
-            fig.savefig(save_path, dpi=300)
+            save_path = os.path.join(save_dir, f"{panel}_Anchor_Celltype_{marker}.png")
+            _savefig(save_path, fig=fig, dpi=300)
             plt.close(fig)
-
             print(f"Saved: {save_path}")
         else:
             plt.show()
@@ -393,15 +423,22 @@ def umap_plate_effect(
     adata_after.obsm["X_umap"] = reducer.transform(adata_after.obsm["X_pca"])
 
     # Plot
+    # Set plate colors
+    all_plates = sorted(set(adata_before.obs[plate_col].unique()) | set(adata_after.obs[plate_col].unique()))
+    plate_palette = _build_plate_palette(all_plates)
+    for _adata in (adata_before, adata_after):
+        _plates = sorted(str(p) for p in _adata.obs[plate_col].unique())
+        _adata.uns[f"{plate_col}_colors"] = [plate_palette[p] for p in _plates]
+
     fig, axes = plt.subplots(2, 1, figsize=(8, 12))
     sc.pl.umap(adata_before, color=plate_col, ax=axes[0], show=False, size=size, alpha=alpha)
-    axes[0].set_title("Before Correction - Plate", fontsize=16, fontweight='bold')
+    axes[0].set_title("Before - Plate", fontsize=16, fontweight='bold')
     sc.pl.umap(adata_after, color=plate_col, ax=axes[1], show=False, size=size, alpha=alpha)
-    axes[1].set_title("After Correction - Plate", fontsize=16, fontweight='bold')
+    axes[1].set_title("After - Plate", fontsize=16, fontweight='bold')
     
     plt.tight_layout()
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        _savefig(save_path, dpi=300, bbox_inches='tight')
     else:
         plt.show()
     plt.close()
@@ -414,7 +451,7 @@ def umap_batch_evaluation(
     df_corrected,
     markers,
     plate_col="plate",
-    celltype_col="cell_type",
+    celltype_col="celltypes",
     subsample=50000,
     random_state=42,
     save_path=None,
@@ -483,9 +520,33 @@ def umap_batch_evaluation(
     sc.pp.neighbors(adata)
     sc.tl.umap(adata, random_state=random_state)
 
+    # Harmonized cell-type colors propagated to slices
+    if do_celltype_plot and celltype_col in adata.obs.columns:
+        unique_types = sorted(str(ct) for ct in adata.obs[celltype_col].unique())
+        ct_palette = _build_celltype_palette(unique_types)
+        adata.uns[f"{celltype_col}_colors"] = [ct_palette.get(ct, '#808080') for ct in unique_types]
+
+    # Set plate colors
+    all_plates = sorted(str(p) for p in adata.obs[plate_col].unique())
+    plate_palette = _build_plate_palette(all_plates)
+    adata.uns[f"{plate_col}_colors"] = [plate_palette[p] for p in all_plates]
+
     # split raw / corrected
-    adata_raw = adata[adata.obs["status"] == "raw"]
-    adata_corr = adata[adata.obs["status"] == "corrected"]
+    adata_raw = adata[adata.obs["status"] == "raw"].copy()
+    adata_corr = adata[adata.obs["status"] == "corrected"].copy()
+
+    # Propagate plate colors to sub-adatas
+    for sub in (adata_raw, adata_corr):
+        _plates = sorted(str(p) for p in sub.obs[plate_col].unique())
+        sub.uns[f"{plate_col}_colors"] = [plate_palette[p] for p in _plates]
+
+    # Apply consistent colors to each sub-adata
+    if do_celltype_plot and celltype_col in adata.uns:
+        ct_palette = _build_celltype_palette(
+            sorted(str(ct) for ct in adata.obs[celltype_col].unique()))
+        for sub in (adata_raw, adata_corr):
+            cats = sorted(str(ct) for ct in sub.obs[celltype_col].unique())
+            sub.uns[f"{celltype_col}_colors"] = [ct_palette.get(ct, '#808080') for ct in cats]
 
     # Width: 1 row per Batch (Raw/Corr), column per Plate view and Celltype view
     n_cols = 2 if do_celltype_plot else 1
@@ -496,22 +557,22 @@ def umap_batch_evaluation(
         axes = axes.reshape(2, 1)
 
     sc.pl.umap(adata_raw, color=plate_col, ax=axes[0,0], show=False)
-    axes[0,0].set_title("Raw - Plate", fontsize=15, fontweight='bold')
+    axes[0,0].set_title("Before - Plate", fontsize=15, fontweight='bold')
 
     if do_celltype_plot:
         sc.pl.umap(adata_raw, color=celltype_col, ax=axes[0,1], show=False)
-        axes[0,1].set_title("Raw - Cell type", fontsize=15, fontweight='bold')
+        axes[0,1].set_title("Before - Cell type", fontsize=15, fontweight='bold')
 
     sc.pl.umap(adata_corr, color=plate_col, ax=axes[1,0], show=False)
-    axes[1,0].set_title("Corrected - Plate", fontsize=15, fontweight='bold')
+    axes[1,0].set_title("After - Plate", fontsize=15, fontweight='bold')
 
     if do_celltype_plot:
         sc.pl.umap(adata_corr, color=celltype_col, ax=axes[1,1], show=False)
-        axes[1,1].set_title("Corrected - Cell type", fontsize=15, fontweight='bold')
+        axes[1,1].set_title("After - Cell type", fontsize=15, fontweight='bold')
 
     plt.tight_layout()
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        _savefig(save_path, dpi=300, bbox_inches='tight')
     else:
         plt.show()
     plt.close()
@@ -525,7 +586,7 @@ def umap_celltype_by_plate(
     df_corrected,
     markers,
     plate_col="plate",
-    celltype_col="cell_type",
+    celltype_col="celltypes",
     subsample=50000,
     random_state=42,
     save_path=None
@@ -540,7 +601,7 @@ def umap_celltype_by_plate(
     warnings.filterwarnings("ignore", category=ImplicitModificationWarning)
 
     # SKIP if cell_type is missing or empty
-    actual_celltype_col = celltype_col if celltype_col in df_raw.columns else ('celltype' if 'celltype' in df_raw.columns else None)
+    actual_celltype_col = celltype_col if celltype_col in df_raw.columns else ('celltypes' if 'celltypes' in df_raw.columns else None)
     if actual_celltype_col is None or df_raw[actual_celltype_col].isnull().all():
         print(f"[SKIP] umap_celltype_by_plate: '{celltype_col}' column is missing or empty.")
         return None
@@ -548,12 +609,11 @@ def umap_celltype_by_plate(
     # keep shared markers
     markers = [m for m in markers if m in df_raw.columns and m in df_corrected.columns and pd.api.types.is_numeric_dtype(df_raw[m]) and pd.api.types.is_numeric_dtype(df_corrected[m])]
 
-    # same subsample index
+    # Sample each DataFrame independently; after panel filtering they may have
+    # disjoint index values so we cannot use the same idx on both.
     n_cells = min(subsample, df_raw.shape[0], df_corrected.shape[0])
-    idx = np.random.RandomState(random_state).choice(df_raw.index, n_cells, replace=False)
-
-    df_raw_sub = df_raw.loc[idx].copy()
-    df_corr_sub = df_corrected.loc[idx].copy()
+    df_raw_sub = df_raw.sample(n=n_cells, random_state=random_state).copy()
+    df_corr_sub = df_corrected.sample(n=n_cells, random_state=random_state).copy()
 
     df_raw_sub["status"] = "raw"
     df_corr_sub["status"] = "corrected"
@@ -573,40 +633,69 @@ def umap_celltype_by_plate(
     sc.pp.neighbors(adata)
     sc.tl.umap(adata, random_state=random_state)
 
+    # Harmonized cell-type colors: build once from all categories
+    unique_types = sorted(str(ct) for ct in adata.obs[celltype_col].unique())
+    ct_palette = _build_celltype_palette(unique_types)
+    adata.uns[f"{celltype_col}_colors"] = [ct_palette.get(ct, '#808080') for ct in unique_types]
+
     plates = sorted(adata.obs[plate_col].unique())
 
-    adata_raw = adata[adata.obs["status"] == "raw"]
-    adata_corr = adata[adata.obs["status"] == "corrected"]
+    # Plate colors
+    plate_palette = _build_plate_palette(plates)
+    adata.uns[f"{plate_col}_colors"] = [plate_palette[str(p)] for p in plates]
+
+    adata_raw = adata[adata.obs["status"] == "raw"].copy()
+    adata_corr = adata[adata.obs["status"] == "corrected"].copy()
+
+    # Derive save directory and stem for per-plate saves
+    if save_path:
+        save_dir_plates = os.path.dirname(save_path)
+        save_stem = os.path.splitext(os.path.basename(save_path))[0]
+    else:
+        save_dir_plates = None
+        save_stem = None
 
     fig, axes = plt.subplots(2, len(plates), figsize=(5*len(plates), 10))
+    if len(plates) == 1:
+        axes = axes.reshape(2, 1)
 
     for i, p in enumerate(plates):
+        # Sub-adatas for this plate; set consistent colors explicitly
+        sub_raw = adata_raw[adata_raw.obs[plate_col] == p].copy()
+        sub_corr = adata_corr[adata_corr.obs[plate_col] == p].copy()
+        for sub in (sub_raw, sub_corr):
+            cats = sorted(str(ct) for ct in sub.obs[celltype_col].unique())
+            sub.uns[f"{celltype_col}_colors"] = [ct_palette.get(ct, '#808080') for ct in cats]
 
-        # Raw
-        sc.pl.umap(
-            adata_raw[adata_raw.obs[plate_col] == p],
-            color=celltype_col,
-            ax=axes[0, i],
-            show=False
-        )
-        axes[0, i].set_title(f"Raw - {p}", fontsize=15, fontweight='bold')
+        # Before
+        sc.pl.umap(sub_raw, color=celltype_col, ax=axes[0, i], show=False)
+        axes[0, i].set_title(f"Before - {p}", fontsize=15, fontweight='bold')
         axes[0, i].set_xlabel("UMAP1", fontsize=12, fontweight='bold')
         axes[0, i].set_ylabel("UMAP2", fontsize=12, fontweight='bold')
 
-        # Corrected
-        sc.pl.umap(
-            adata_corr[adata_corr.obs[plate_col] == p],
-            color=celltype_col,
-            ax=axes[1, i],
-            show=False
-        )
-        axes[1, i].set_title(f"Corrected - {p}", fontsize=15, fontweight='bold')
+        # After
+        sc.pl.umap(sub_corr, color=celltype_col, ax=axes[1, i], show=False)
+        axes[1, i].set_title(f"After - {p}", fontsize=15, fontweight='bold')
         axes[1, i].set_xlabel("UMAP1", fontsize=12, fontweight='bold')
         axes[1, i].set_ylabel("UMAP2", fontsize=12, fontweight='bold')
 
+        # Save individual per-plate figure
+        if save_dir_plates:
+            fig_p, axes_p = plt.subplots(1, 2, figsize=(12, 6))
+            for sub, ax_p, label in [(sub_raw, axes_p[0], "Before"), (sub_corr, axes_p[1], "After")]:
+                sc.pl.umap(sub, color=celltype_col, ax=ax_p, show=False)
+                ax_p.set_title(f"{label} - {p}", fontsize=15, fontweight='bold')
+                ax_p.set_xlabel("UMAP1", fontsize=12, fontweight='bold')
+                ax_p.set_ylabel("UMAP2", fontsize=12, fontweight='bold')
+            fig_p.suptitle(f"Cell Types - {p}", fontsize=16, fontweight='bold')
+            plt.tight_layout()
+            safe_p = str(p).replace("/", "_").replace(" ", "_")
+            _savefig(os.path.join(save_dir_plates, f"{save_stem}_{safe_p}.png"), fig=fig_p, dpi=300, bbox_inches='tight')
+            plt.close(fig_p)
+
     plt.tight_layout()
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        _savefig(save_path, dpi=300, bbox_inches='tight')
     else:
         plt.show()
     plt.close()
@@ -665,30 +754,34 @@ def compute_emd_mad(
         clusters = sorted(df_raw_nodes["EMD_Cluster"].dropna().unique())
     else:
         print(f"  [INFO] No cluster column provided or found. Training SOM ({grid_rows}x{grid_cols}) for population stratification.")
-        # Train SOM on corrected data
         X_corr = df_corr[markers].fillna(0).values
+        X_raw  = df_raw[markers].fillna(0).values
         scaler = StandardScaler()
         X_corr_scaled = scaler.fit_transform(X_corr)
+        X_raw_scaled  = scaler.transform(X_raw)
 
-        som = somoclu.Somoclu(
-            n_rows=grid_rows,
-            n_columns=grid_cols,
-            maptype="planar",
-            initialization="pca"
-        )
-        som.train(X_corr_scaled)
+        try:
+            som = somoclu.Somoclu(
+                n_rows=grid_rows,
+                n_columns=grid_cols,
+                maptype="planar",
+                initialization="pca"
+            )
+            som.train(X_corr_scaled)
+            bmus_corr = som.bmus
+            node_corr = bmus_corr[:,0] * grid_cols + bmus_corr[:,1]
+            bmus_raw  = som.get_bmus(X_raw_scaled)
+            node_raw  = bmus_raw[:,0] * grid_cols + bmus_raw[:,1]
+        except Exception as som_err:
+            print(f"  [WARN] SOM failed ({som_err}). Falling back to KMeans clustering.")
+            from sklearn.cluster import KMeans
+            n_clusters = grid_rows * grid_cols
+            km = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+            node_corr = km.fit_predict(X_corr_scaled)
+            node_raw  = km.predict(X_raw_scaled)
 
-        # Assign SOM nodes
-        bmus_corr = som.bmus
-        node_corr = bmus_corr[:,0] * grid_cols + bmus_corr[:,1]
         df_corr_nodes["EMD_Cluster"] = node_corr
-
-        X_raw = df_raw[markers].fillna(0).values
-        X_raw_scaled = scaler.transform(X_raw)
-        bmus_raw = som.get_bmus(X_raw_scaled)
-        node_raw = bmus_raw[:,0] * grid_cols + bmus_raw[:,1]
-        df_raw_nodes["EMD_Cluster"] = node_raw
-        
+        df_raw_nodes["EMD_Cluster"]  = node_raw
         clusters = sorted(df_corr_nodes["EMD_Cluster"].unique())
 
     plates = df_raw_nodes[plate_col].unique()
@@ -802,9 +895,8 @@ def plot_emd(emd_df, mad_score, save_path=None):
     if save_path is not None and not os.path.exists(save_path):
         os.makedirs(save_path, exist_ok=True)
 
-    # Use fixed colors: raw=red, corrected=blue
-    raw_color = "#E74C3C"  # Red
-    corr_color = "#3498DB" # Blue
+    raw_color = _BEFORE_COLOR
+    corr_color = _AFTER_COLOR
 
     # GLOBAL KDE PLOT
     emd_raw_mean = emd_df["EMD_raw"].mean()
@@ -819,15 +911,15 @@ def plot_emd(emd_df, mad_score, save_path=None):
     if save_path is not None:
         p_val_path = os.path.join(save_path, "emd_p_value.txt")
         with open(p_val_path, "w") as f:
-            f.write(f"Wilcoxon Signed-Rank Test (EMD Raw vs Corrected)\n")
-            f.write(f"Alternative hypothesis: Raw > Corrected\n")
+            f.write(f"Wilcoxon Signed-Rank Test (EMD Before vs After)\n")
+            f.write(f"Alternative hypothesis: Before > After\n")
             f.write(f"Statistic: {stat:.4f}\n")
             f.write(f"P-Value: {p_val:.2e}\n")
         print(f"P-value saved to: {p_val_path}")
 
     plt.figure(figsize=(7,5))
-    sns.kdeplot(emd_df["EMD_raw"], fill=True, alpha=0.4, linewidth=2, label="Raw", color=raw_color)
-    sns.kdeplot(emd_df["EMD_corr"], fill=True, alpha=0.4, linewidth=2, label="Corrected", color=corr_color)
+    sns.kdeplot(emd_df["EMD_raw"], fill=True, alpha=0.4, linewidth=2, label="Before", color=raw_color)
+    sns.kdeplot(emd_df["EMD_corr"], fill=True, alpha=0.4, linewidth=2, label="After", color=corr_color)
 
     textstr = (
         f"Mean EMD reduction = {emd_reduction_mean:.3f}\n"
@@ -844,7 +936,7 @@ def plot_emd(emd_df, mad_score, save_path=None):
     plt.grid(alpha=0.3)
     plt.tight_layout()
     if save_path is not None:
-        plt.savefig(os.path.join(save_path, "EMD_global_KDE.png"), dpi=300)
+        _savefig(os.path.join(save_path, "EMD_global_KDE.png"), dpi=300)
     else:
         plt.show()
     plt.close()
@@ -853,12 +945,12 @@ def plot_emd(emd_df, mad_score, save_path=None):
     emd_long = []
     # Combine plate1 and plate2 data for a comprehensive per-plate view
     for _, row in emd_df.iterrows():
-        emd_long.append({'Plate': row['plate1'], 'EMD': row['EMD_raw'], 'Condition': 'Raw', 'Marker': row['marker']})
-        emd_long.append({'Plate': row['plate1'], 'EMD': row['EMD_corr'], 'Condition': 'Corrected', 'Marker': row['marker']})
+        emd_long.append({'Plate': row['plate1'], 'EMD': row['EMD_raw'], 'Condition': 'Before', 'Marker': row['marker']})
+        emd_long.append({'Plate': row['plate1'], 'EMD': row['EMD_corr'], 'Condition': 'After', 'Marker': row['marker']})
         # If plate1 != plate2 (cross-plate internal comparison)
         if row['plate1'] != row['plate2']:
-            emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_raw'], 'Condition': 'Raw', 'Marker': row['marker']})
-            emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_corr'], 'Condition': 'Corrected', 'Marker': row['marker']})
+            emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_raw'], 'Condition': 'Before', 'Marker': row['marker']})
+            emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_corr'], 'Condition': 'After', 'Marker': row['marker']})
     
     plot_data = pd.DataFrame(emd_long)
     plates_sorted = sorted(plot_data['Plate'].unique(), key=lambda x: str(x))
@@ -866,16 +958,15 @@ def plot_emd(emd_df, mad_score, save_path=None):
     plt.figure(figsize=(max(10, len(plates_sorted) * 2.5), 7))
     sns.set_theme(style="white", font_scale=1.3)
 
-    # Use the same aesthetics as variance plots
-    raw_color_v = "#D98880" 
-    corr_color_v = "#7FB3D5"
+    raw_color_v = _BEFORE_COLOR
+    corr_color_v = _AFTER_COLOR
 
     ax = sns.boxplot(
         data=plot_data,
         x='Plate',
         y='EMD',
         hue='Condition',
-        palette={'Raw': raw_color_v, 'Corrected': corr_color_v},
+        palette={'Before': raw_color_v, 'After': corr_color_v},
         width=0.6,
         linewidth=1.2,
         showfliers=False,
@@ -903,14 +994,14 @@ def plot_emd(emd_df, mad_score, save_path=None):
         y='EMD',
         hue='Condition',
         dodge=True,
-        jitter=0.2,
+        jitter=0.1,
         size=3.5,
         alpha=0.4,
         linewidth=0.5,
         edgecolor='black',
         order=plates_sorted,
-        hue_order=['Raw', 'Corrected'],
-        palette={'Raw': "#922B21", 'Corrected': "#1F618D"},
+        hue_order=['Before', 'After'],
+        palette={'Before': _BEFORE_COLOR, 'After': _AFTER_COLOR},
         legend=False
     )
 
@@ -919,8 +1010,8 @@ def plot_emd(emd_df, mad_score, save_path=None):
     p_values = []
     comparison_indices = []
     for i, plate in enumerate(plates_sorted):
-        raw_vals = plot_data[(plot_data['Plate'] == plate) & (plot_data['Condition'] == 'Raw')]['EMD'].values
-        corr_vals = plot_data[(plot_data['Plate'] == plate) & (plot_data['Condition'] == 'Corrected')]['EMD'].values
+        raw_vals = plot_data[(plot_data['Plate'] == plate) & (plot_data['Condition'] == 'Before')]['EMD'].values
+        corr_vals = plot_data[(plot_data['Plate'] == plate) & (plot_data['Condition'] == 'After')]['EMD'].values
         
         if len(raw_vals) > 0 and len(corr_vals) > 0:
             try:
@@ -967,7 +1058,7 @@ def plot_emd(emd_df, mad_score, save_path=None):
         
     plt.tight_layout()
     if save_path is not None:
-        plt.savefig(os.path.join(save_path, "EMD_per_plate_boxplot.png"), dpi=300)
+        _savefig(os.path.join(save_path, "EMD_per_plate_boxplot.png"), dpi=300)
     else:
         plt.show()
     plt.close()
@@ -988,8 +1079,8 @@ def plot_emd(emd_df, mad_score, save_path=None):
         mad_plate_median = mad_plate["MAD_score"].median() if not mad_plate.empty else np.nan
 
         plt.figure(figsize=(7,5))
-        sns.kdeplot(df_plate["EMD_raw"], fill=True, alpha=0.4, linewidth=2, label="Raw", color=raw_color)
-        sns.kdeplot(df_plate["EMD_corr"], fill=True, alpha=0.4, linewidth=2, label="Corrected", color=corr_color)
+        sns.kdeplot(df_plate["EMD_raw"], fill=True, alpha=0.4, linewidth=2, label="Before", color=raw_color)
+        sns.kdeplot(df_plate["EMD_corr"], fill=True, alpha=0.4, linewidth=2, label="After", color=corr_color)
 
         textstr = (
             f"Plate = {plate}\n"
@@ -1008,7 +1099,7 @@ def plot_emd(emd_df, mad_score, save_path=None):
         plt.grid(alpha=0.3)
         plt.tight_layout()
         if save_path is not None:
-            plt.savefig(os.path.join(save_path, f"EMD_KDE_{plate}.png"), dpi=300)
+            _savefig(os.path.join(save_path, f"EMD_KDE_{plate}.png"), dpi=300)
         else:
             plt.show()
         plt.close()
@@ -1026,9 +1117,8 @@ def plot_emd_per_marker(emd_df, save_path=None):
     if save_path is not None and not os.path.exists(save_path):
         os.makedirs(save_path, exist_ok=True)
 
-    # Use fixed colors: raw=red, corrected=blue
-    raw_color = "#E74C3C"  # Red
-    corr_color = "#3498DB" # Blue
+    raw_color = _BEFORE_COLOR
+    corr_color = _AFTER_COLOR
 
     # Combine plate1 and plate2 to get all plate involvements for EMD data
     emd_p1 = emd_df[['plate1', 'marker', 'EMD_raw', 'EMD_corr']].rename(columns={'plate1': 'Plate'})
@@ -1085,7 +1175,7 @@ def plot_emd_per_marker(emd_df, save_path=None):
             y='EMD',
             color='black',
             alpha=0.4,
-            jitter=0.2,
+            jitter=0.1,
             size=4
         )
 
@@ -1120,7 +1210,7 @@ def plot_emd_per_marker(emd_df, save_path=None):
 
         if save_path is not None:
             safe_plate_name = str(plate).replace("/", "_").replace("\\", "_")
-            plt.savefig(os.path.join(save_path, f"EMD_marker_boxplot_{safe_plate_name}.png"), dpi=300)
+            _savefig(os.path.join(save_path, f"EMD_marker_boxplot_{safe_plate_name}.png"), dpi=300)
         else:
             plt.show()
         plt.close()
@@ -1160,8 +1250,8 @@ def variation_marker(df, markers, group_col, info_cols, panel=None, subsample=10
             if col in df_group.columns:
                 # Drop rows with NaN in the current factor for ANOVA stability
                 if df_group[col].notna().any() and df_group[col].nunique() > 1:
-                    # Specific check for cell_type: skip if only "unknown" or "Unassigned"
-                    if col == 'cell_type' or col == 'celltype':
+                    # Specific check for celltypes: skip if only "unknown" or "Unassigned"
+                    if col == 'celltypes' or col == 'celltype':
                         unique_vals = [v for v in df_group[col].dropna().unique() if str(v).lower() not in ['unknown', 'unassigned', 'n/a']]
                         if len(unique_vals) < 2:
                             continue
@@ -1176,6 +1266,7 @@ def variation_marker(df, markers, group_col, info_cols, panel=None, subsample=10
         if df_clean.empty:
             continue
 
+        n_cells = len(df_clean)
         for marker in markers:
             # Build regression formula: Marker ~ factors
             formula = f'Q("{marker}") ~ ' + " + ".join([f'Q("{col}")' for col in active_cols])
@@ -1185,24 +1276,28 @@ def variation_marker(df, markers, group_col, info_cols, panel=None, subsample=10
                 model = ols(formula, data=df_clean).fit()
                 # Type II ANOVA (more robust for unbalanced designs)
                 anova_res = sm.stats.anova_lm(model, typ=2)
-                
+
+                total_ss = anova_res["sum_sq"].sum()
                 # Compute proportion of variance explained
-                var_exp_per_factor = anova_res["sum_sq"] / anova_res["sum_sq"].sum()
-                
+                var_exp_per_factor = anova_res["sum_sq"] / total_ss
+
                 for factor_raw, val in var_exp_per_factor.items():
                     # Clean the factor name from Q("...")
                     factor = factor_raw
                     if factor_raw.startswith('Q("') and factor_raw.endswith('")'):
                         factor = factor_raw[3:-2]
-                    
+
                     if factor == 'Residual':
                         continue
 
+                    abs_ss = anova_res.loc[factor_raw, "sum_sq"] / n_cells  # SS per cell, comparable across runs
                     all_res.append({
                         'group': group,
                         'marker': marker,
                         'factor': factor,
-                        'variance_explained': val
+                        'variance_explained': val,       # proportion (R²)
+                        'sum_sq_per_cell': abs_ss,       # absolute variance, comparable before/after
+                        'n_cells': n_cells,
                     })
             except Exception as e:
                 pass
@@ -1222,8 +1317,8 @@ def plot_variance_marker_boxplot(var_marker_raw, var_marker_corr, plate_col='pla
 
     # Style setup
     sns.set_theme(style="white", font_scale=1.1)
-    raw_color = "#D98880" 
-    corr_color = "#7FB3D5" 
+    raw_color = _BEFORE_COLOR
+    corr_color = _AFTER_COLOR
 
     # Add Stage column
     var_marker_raw = var_marker_raw.copy()
@@ -1252,7 +1347,7 @@ def plot_variance_marker_boxplot(var_marker_raw, var_marker_corr, plate_col='pla
     available_factors = plot_data['factor'].unique()
     
     # Priority order for factors
-    priority_order = ['plate', 'sample_name', 'cell_type', 'celltype', 'Time', 'condition', 'dataset']
+    priority_order = ['plate', 'sample_name', 'celltypes', 'celltype', 'Time', 'condition', 'dataset']
     factors = sorted(available_factors, key=lambda x: priority_order.index(x) if x in priority_order else 99)
     
     # Setup Figure (Dynamic width based on factor count)
@@ -1282,13 +1377,13 @@ def plot_variance_marker_boxplot(var_marker_raw, var_marker_corr, plate_col='pla
         y=y_col,
         hue='Stage',
         dodge=True,
-        jitter=0.25,
+        jitter=0.1,
         size=4.5,
         alpha=0.5,
         linewidth=0.6,
         edgecolor='black',
         order=factors,
-        palette={'Before': "#922B21", 'After': "#1F618D"},
+        palette={'Before': _BEFORE_COLOR, 'After': _AFTER_COLOR},
         legend=False
     )
 
@@ -1363,26 +1458,85 @@ def plot_variance_marker_boxplot(var_marker_raw, var_marker_corr, plate_col='pla
 
     sns.despine()
     plt.grid(axis='y', linestyle='--', alpha=0.3, color='grey')
-    
+
     # Customize legend
-    leg = plt.legend(title="Stage", frameon=True, facecolor='white', loc='upper left', 
-                        bbox_to_anchor=(1.02, 1), borderaxespad=0, fontsize=13)
+    leg = plt.legend(title="Stage", frameon=True, facecolor='white', loc='upper left',
+                     bbox_to_anchor=(1.02, 1), borderaxespad=0, fontsize=13)
     leg.set_title("Stage", prop={'size': 14, 'weight': 'bold'})
     for text in leg.get_texts():
         text.set_fontweight('bold')
-    
-    # Tight_layout but handle potential overlaps gracefully
+
+    # Add footnote explaining the proportional-vs-absolute issue for Time
+    ax.annotate(
+        "* Proportional R² for Time may increase after batch correction (plate variance\n"
+        "  removed → smaller denominator). See 'Absolute Time Variance' panel below.",
+        xy=(0, -0.18), xycoords='axes fraction',
+        fontsize=9, color='#7F8C8D', style='italic'
+    )
+
     try:
-        plt.tight_layout(rect=[0, 0, 0.9, 1])
+        plt.tight_layout(rect=[0, 0.05, 0.9, 1])
     except Exception:
         pass
 
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        _savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Marker-level variance boxplot saved to: {save_path}")
     else:
         plt.show()
     plt.close()
+
+    # ── Second panel: Absolute Time variance (SS/cell) ─────────────────────────
+    # This is the ground truth for whether time correction actually worked.
+    # If SS/cell for Time decreases, correction is effective regardless of proportion change.
+    has_abs = 'sum_sq_per_cell' in plot_data.columns
+    time_data = plot_data[plot_data['factor'] == 'Time'] if has_abs and 'Time' in plot_data['factor'].values else None
+    if time_data is not None and not time_data.empty and has_abs:
+        fig2, ax2 = plt.subplots(figsize=(5, 5))
+        sns.boxplot(
+            data=time_data, x='Stage', y='sum_sq_per_cell',
+            palette={'Before': raw_color, 'After': corr_color},
+            order=['Before', 'After'], width=0.5,
+            linewidth=1.5, showfliers=False,
+            boxprops=dict(edgecolor="#4D5656"),
+            whiskerprops=dict(color="#4D5656"),
+            capprops=dict(color="#4D5656"),
+            medianprops=dict(color="#2C3E50", linewidth=2.0),
+            ax=ax2
+        )
+        sns.stripplot(
+            data=time_data, x='Stage', y='sum_sq_per_cell',
+            palette={'Before': raw_color, 'After': corr_color},
+            order=['Before', 'After'], dodge=False, jitter=0.15,
+            size=4, alpha=0.5, linewidth=0.5, edgecolor='black',
+            legend=False, ax=ax2
+        )
+        b_vals = time_data[time_data['Stage'] == 'Before']['sum_sq_per_cell'].dropna()
+        a_vals = time_data[time_data['Stage'] == 'After']['sum_sq_per_cell'].dropna()
+        if len(b_vals) > 1 and len(a_vals) > 1:
+            try:
+                _, p = wilcoxon(b_vals.values, a_vals.values, alternative='two-sided')
+            except Exception:
+                _, p = mannwhitneyu(b_vals.values, a_vals.values, alternative='two-sided')
+            stars = "****" if p < 0.0001 else "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "ns"
+            y_top = max(b_vals.max(), a_vals.max())
+            h = y_top * 0.05
+            ax2.plot([0, 0, 1, 1], [y_top + h, y_top + 2*h, y_top + 2*h, y_top + h], lw=1.5, c='#566573')
+            ax2.text(0.5, y_top + 2*h, stars, ha='center', va='bottom', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Absolute Time Variance (SS / n_cells)', fontsize=12, fontweight='bold')
+        ax2.set_title('Absolute Time Variance Before vs After\n(↓ means time correction worked)', fontsize=13, fontweight='bold')
+        ax2.set_xlabel('')
+        ax2.tick_params(labelsize=12)
+        sns.despine(ax=ax2)
+        ax2.grid(axis='y', linestyle='--', alpha=0.3, color='grey')
+        plt.tight_layout()
+        if save_path:
+            abs_path = os.path.splitext(save_path)[0] + '_absolute_time.png'
+            _savefig(abs_path, dpi=300, bbox_inches='tight')
+            print(f"Absolute time variance plot saved to: {abs_path}")
+        else:
+            plt.show()
+        plt.close()
 
 
 # Correlation of marker correlations before and after correction, to assess preservation of relationships between markers
@@ -1434,15 +1588,15 @@ def marker_corr(
 
         # scatter plot
         plt.figure(figsize=(5,5))
-        plt.scatter(corr_b_vals, corr_a_vals, alpha=0.5, s=15, color='dodgerblue', label='All pairs')
+        plt.scatter(corr_b_vals, corr_a_vals, alpha=0.5, s=15, color=_AFTER_COLOR, label='All pairs')
         plt.plot([-1,1], [-1,1], 'r--', lw=1)
-        plt.xlabel('Correlation BEFORE')
-        plt.ylabel('Correlation AFTER')
+        plt.xlabel('Correlation Before', fontsize=12, fontweight='bold')
+        plt.ylabel('Correlation After', fontsize=12, fontweight='bold')
         plt.title(f'Plate {plate} correlation preservation\nR={R:.2f}')
         plt.legend(loc='lower right')
         plt.tight_layout()
         if save_dir:
-            plt.savefig(os.path.join(save_dir,f"scatter_plate_{plate}.png"),dpi=300)
+            _savefig(os.path.join(save_dir, f"scatter_plate_{plate}.png"), dpi=300)
         else:
             plt.show()
         plt.close()
@@ -1493,10 +1647,10 @@ def marker_corr(
 
             # scatter plot
             plt.figure(figsize=(5,5))
-            plt.scatter(corr_b_vals, corr_a_vals, alpha=0.5, s=15, color='dodgerblue', label='All pairs')
+            plt.scatter(corr_b_vals, corr_a_vals, alpha=0.5, s=15, color=_AFTER_COLOR, label='All pairs')
             plt.plot([-1,1], [-1,1],'r--', lw=1)
-            plt.xlabel('Correlation BEFORE')
-            plt.ylabel('Correlation AFTER')
+            plt.xlabel('Correlation Before', fontsize=12, fontweight='bold')
+            plt.ylabel('Correlation After', fontsize=12, fontweight='bold')
             title = "Marker correlation preservation"
             if celltype_col:
                 title += f'\nCellType: {record["celltype"]}'
@@ -1529,12 +1683,21 @@ def marker_corr(
                 else:
                     save_name = f"scatter_all_combined.png"
                 
-                plt.savefig(os.path.join(save_dir, save_name), dpi=300)
+                _savefig(os.path.join(save_dir, save_name), dpi=300)
             else:
                 plt.show()
             plt.close()
 
     summary_df = pd.DataFrame(summary_records)
+
+    # FDR correction (Benjamini-Hochberg) across all plate + group tests
+    if not summary_df.empty and "p_value" in summary_df.columns:
+        valid = summary_df["p_value"].notna()
+        p_adj = np.full(len(summary_df), np.nan)
+        if valid.any():
+            _, p_adj_vals, _, _ = multipletests(summary_df.loc[valid, "p_value"].values, method="fdr_bh")
+            p_adj[valid.values] = p_adj_vals
+        summary_df["p_value_adj"] = p_adj
 
     # Save marker correlation results to CSV
     if save_dir:
@@ -1551,7 +1714,7 @@ def visualize_shared_marker_correction(
     df_raw_P2=None, df_corrected_P2=None,
     markers_P1=None, markers_P2=None,
     plate_col="plate",
-    celltype_col="cell_type",
+    celltype_col="celltypes",
     panel_col="panel",
     subsample=50000,
     random_state=42,
@@ -1644,6 +1807,16 @@ def visualize_shared_marker_correction(
     sc.pp.neighbors(adata)
     sc.tl.umap(adata, random_state=random_state)
 
+    # Set panel colors
+    unique_panels = sorted(adata.obs[panel_col].unique())
+    _panel_color_map = {"Panel1": _PANEL1_COLOR, "Panel2": _PANEL2_COLOR}
+    adata.uns[f"{panel_col}_colors"] = [_panel_color_map.get(p, '#808080') for p in unique_panels]
+
+    # Set plate colors
+    all_plates = sorted(str(p) for p in adata.obs[plate_col].unique())
+    plate_palette = _build_plate_palette(all_plates)
+    adata.uns[f"{plate_col}_colors"] = [plate_palette[p] for p in all_plates]
+
     # Layout per panel, colored by Plate
     panels_to_plot = ["Panel1"]
     if has_p2: panels_to_plot.append("Panel2")
@@ -1669,11 +1842,16 @@ def visualize_shared_marker_correction(
     plt.tight_layout()
     plt.suptitle("UMAP of Marker Correction - Plate Coloring", fontsize=18, fontweight='bold', y=1.02)
     if save_dir:
-        plt.savefig(os.path.join(save_dir, "umap_shared_by_plate.png"), dpi=300, bbox_inches='tight')
+        _savefig(os.path.join(save_dir, "umap_shared_by_plate.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
     # layout per panel, colored by Cell Type
     if celltype_col in adata.obs.columns:
+        # Apply Alexandrite palette to cell types
+        unique_types = sorted(str(ct) for ct in adata.obs[celltype_col].dropna().unique())
+        ct_palette = _build_celltype_palette(unique_types)
+        adata.uns[f"{celltype_col}_colors"] = [ct_palette.get(ct, '#808080') for ct in unique_types]
+
         fig, axes = plt.subplots(2, len(panels_to_plot), figsize=(6 * len(panels_to_plot), 10), squeeze=False)
         for i, status in enumerate(["Before", "After"]):
             for j, panel in enumerate(panels_to_plot):
@@ -1693,7 +1871,7 @@ def visualize_shared_marker_correction(
         plt.tight_layout()
         plt.suptitle("UMAP of Marker Correction - Cell Type Coloring", fontsize=18, fontweight='bold', y=1.02)
         if save_dir:
-            plt.savefig(os.path.join(save_dir, "umap_shared_by_celltype.png"), dpi=300, bbox_inches='tight')
+            _savefig(os.path.join(save_dir, "umap_shared_by_celltype.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
     # Combined Panels, separate UMAPs for Before and After, color by panel
@@ -1716,7 +1894,7 @@ def visualize_shared_marker_correction(
     plt.tight_layout()
     plt.suptitle("UMAP of Shared Marker Correction - Panel Coloring", fontsize=18, fontweight='bold', y=1.02)
     if save_dir:
-        plt.savefig(os.path.join(save_dir, "umap_shared_by_panel.png"), dpi=300, bbox_inches='tight')
+        _savefig(os.path.join(save_dir, "umap_shared_by_panel.png"), dpi=300, bbox_inches='tight')
     else:
         plt.show()
     plt.close()
@@ -1728,9 +1906,9 @@ def visualize_shared_marker_correction(
 # Compute variance of each marker within each cell type before and after correction
 def compute_celltype_variance(df_raw, df_corrected, batch_col='plate', ctx=None):
     # Detect available cell type column
-    celltype_col = 'cell_type' if 'cell_type' in df_raw.columns else ('celltype' if 'celltype' in df_raw.columns else None)
+    celltype_col = 'celltypes' if 'celltypes' in df_raw.columns else ('celltype' if 'celltype' in df_raw.columns else None)
     
-    # SKIP if cell_type is missing or entirely empty
+    # SKIP if celltypes is missing or entirely empty
     if celltype_col is None:
         print(f"[SKIP] compute_celltype_variance: No cell type column found.")
         return pd.DataFrame(), pd.DataFrame()
@@ -1781,14 +1959,14 @@ def compute_celltype_variance(df_raw, df_corrected, batch_col='plate', ctx=None)
     return var_marker_raw.astype(float), var_marker_corr.astype(float)
 
 
-def compute_metrics(df_after, markers, df_before, batch_key='plate', label_key='cell_type', subsample=10000, n_iterations=5, random_state=42):
+def compute_metrics(df_after, markers, df_before, batch_key='plate', label_key='celltypes', subsample=10000, n_iterations=5, random_state=42):
     """
     Compute batch correction metrics using a PAIRED bootstrapping approach.
     For each iteration, the SAME cell indices are sampled from before and after data.
     """
 
     # 1. Fallback for label key
-    actual_label_key = label_key if label_key in df_after.columns else ('celltype' if 'celltype' in df_after.columns else None)
+    actual_label_key = label_key if label_key in df_after.columns else ('celltypes' if 'celltypes' in df_after.columns else None)
     
     # Check if we have valid labels
     has_labels = False
@@ -1918,16 +2096,16 @@ def plot_metrics_comparison(metrics_before, metrics_after, panel, save_dir):
     
     # Style setup
     sns.set_theme(style="white", font_scale=1.1)
-    raw_color = "#D98880"  # Muted Red
-    corr_color = "#7FB3D5" # Muted Blue
+    raw_color = _BEFORE_COLOR
+    corr_color = _AFTER_COLOR
 
     all_labels = [
-        'ASW (Batch)', 
-        'PCR comparison',
-        'Graph Connectivity',
-        'ASW (Cell-type)', 
-        'NMI (Conservation)',
-        'ARI (Conservation)'
+        'ASW (Batch) ↓',        # lower is better — batch silhouette should shrink
+        'PCR ↓',                 # lower is better — plate variance in PCA should shrink
+        'Graph Connectivity ↑',  # higher is better — cells should mix across batches
+        'ASW (Cell-type) ↑',    # higher is better — cell types should stay separated
+        'NMI (Conservation) ↑', # higher is better — cluster labels should be preserved
+        'ARI (Conservation) ↑'  # higher is better — cluster labels should be preserved
     ]
     
     metric_keys = ['asw_batch', 'pcr', 'graph_connectivity', 'asw_label', 'nmi', 'ari']
@@ -2098,7 +2276,7 @@ def plot_metrics_comparison(metrics_before, metrics_after, panel, save_dir):
     # Adjust layout to make room for bottom annotations and side legend
     plt.tight_layout(rect=[0, 0.05, 1, 1])
     save_path = os.path.join(save_dir, f"{panel}_metrics_summary_plot.png")
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    _savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     
     # Save results to CSV
@@ -2141,8 +2319,6 @@ def plot_variance_bar_celltype(var_P1_before, var_P1_after, var_P2_before=None, 
     all_celltypes = sorted(list(set(flat_list)))
 
     n_celltypes = len(all_celltypes)
-    colors = sns.color_palette("Set2", n_colors=n_celltypes)
-    ct_to_color = dict(zip(all_celltypes, colors))
 
     # Calculate figure width based on number of cell types and panels
     n_axes = len(panels)
@@ -2158,12 +2334,9 @@ def plot_variance_bar_celltype(var_P1_before, var_P1_after, var_P2_before=None, 
         mean_before = df_before.mean(axis=1).reindex(all_celltypes, fill_value=0)
         mean_after = df_after.mean(axis=1).reindex(all_celltypes, fill_value=0)
         
-        # Get colors matching the global celltype order
-        current_colors = [ct_to_color[ct] for ct in all_celltypes]
-        
-        # Bar plot
-        ax.bar(x - width/2, mean_before, width=width, color=current_colors, label='Before', edgecolor='black')
-        ax.bar(x + width/2, mean_after, width=width, color=current_colors, alpha=0.5, label='After', edgecolor='black')
+        # Bar plot: Before/After use consistent global colors across all figures
+        ax.bar(x - width/2, mean_before, width=width, color=_BEFORE_COLOR, label='Before', edgecolor='black')
+        ax.bar(x + width/2, mean_after, width=width, color=_AFTER_COLOR, label='After', edgecolor='black')
         
         ax.set_xticks(x)
         ax.set_xticklabels(all_celltypes, rotation=45, ha='right', fontsize=11)
@@ -2171,18 +2344,18 @@ def plot_variance_bar_celltype(var_P1_before, var_P1_after, var_P2_before=None, 
         ax.set_ylabel("Mean Marker Variance", fontsize=13, fontweight='bold')
         ax.axhline(0, color='grey', linestyle='--')
     
-    # Create a single legend for both markers (at the right of the last axis)
+    # Create a single legend for both stages
     legend_handles = [
-        plt.Rectangle((0,0),1,1, color='grey', label='Before', edgecolor='black'),
-        plt.Rectangle((0,0),1,1, color='grey', alpha=0.5, label='After', edgecolor='black')
+        plt.Rectangle((0,0),1,1, color=_BEFORE_COLOR, label='Before', edgecolor='black'),
+        plt.Rectangle((0,0),1,1, color=_AFTER_COLOR, label='After', edgecolor='black')
     ]
     axes[0, n_axes-1].legend(handles=legend_handles, bbox_to_anchor=(1.05, 1), loc='upper left', title='Stage', fontsize=11, title_fontsize=12)
 
     plt.suptitle("Variance of Shared Markers by Cell Type", fontsize=17, fontweight='bold', y=1.02)
     plt.tight_layout(rect=[0, 0, 1.15, 1])
-    
+
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        _savefig(save_path, dpi=300, bbox_inches='tight')
     else:
         plt.show()
 
@@ -2259,7 +2432,7 @@ def umap_marker_expression(df_before, df_after, markers, panel_name, subsample=5
     plt.suptitle(f"{panel_name} - Marker UMAP", fontsize=18, fontweight='bold')
     plt.tight_layout(rect=[0,0,1,0.98])
     if save_path:
-        plt.savefig(save_path, bbox_inches="tight")
+        _savefig(save_path, fig=fig, bbox_inches="tight")
         print(f"UMAP marker expression plot saved to: {save_path}")
     else:
         plt.show()
@@ -2276,7 +2449,7 @@ def marker_expression_correlation_plot(df_P1_before, df_P1_after,
     else:
         exclude_cols = ["panel","plate","sample_name","dataset",
                         "Event_length","Time","Anchor",
-                        "condition","cell_type", "original_filename"]
+                        "condition","celltypes", "original_filename"]
     
     # Numeric markers only
     markers_P1 = [c for c in df_P1_before.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_P1_before[c])]
@@ -2294,22 +2467,42 @@ def marker_expression_correlation_plot(df_P1_before, df_P1_after,
     })
     
     dfs_to_concat = [df_P1]
-    
+
     # Panel2 markers
     has_p2 = (df_P2_before is not None and df_P2_after is not None)
     if has_p2:
         markers_P2 = [c for c in df_P2_before.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_P2_before[c]) and c and str(c).strip()]
-        p2_before = df_P2_before[markers_P2].median()
-        p2_after = df_P2_after[markers_P2].median()
-        
-        df_P2 = pd.DataFrame({
-            "marker": markers_P2,
-            "before": p2_before.values,
-            "after": p2_after.values,
-            "panel": "Panel2"
-        })
+        # Restrict to shared markers across both panels
+        shared_markers = sorted(set(markers_P1) & set(markers_P2))
+        if shared_markers:
+            p1_before_shared = df_P1_before[shared_markers].median()
+            p1_after_shared = df_P1_after[shared_markers].median()
+            df_P1 = pd.DataFrame({
+                "marker": shared_markers,
+                "before": p1_before_shared.values,
+                "after": p1_after_shared.values,
+                "panel": "Panel1"
+            })
+            dfs_to_concat = [df_P1]
+            p2_before = df_P2_before[shared_markers].median()
+            p2_after = df_P2_after[shared_markers].median()
+            df_P2 = pd.DataFrame({
+                "marker": shared_markers,
+                "before": p2_before.values,
+                "after": p2_after.values,
+                "panel": "Panel2"
+            })
+        else:
+            p2_before = df_P2_before[markers_P2].median()
+            p2_after = df_P2_after[markers_P2].median()
+            df_P2 = pd.DataFrame({
+                "marker": markers_P2,
+                "before": p2_before.values,
+                "after": p2_after.values,
+                "panel": "Panel2"
+            })
         dfs_to_concat.append(df_P2)
-    
+
     # Combine
     df = pd.concat(dfs_to_concat, ignore_index=True)
     
@@ -2335,7 +2528,7 @@ def marker_expression_correlation_plot(df_P1_before, df_P1_after,
     
     # Plot
     plt.figure(figsize=(7,7))
-    colors = {"Panel1":"steelblue", "Panel2":"darkorange"}
+    colors = {"Panel1": _PANEL1_COLOR, "Panel2": _PANEL2_COLOR}
     
     panels_to_plot = ["Panel1"]
     if has_p2: panels_to_plot.append("Panel2")
@@ -2351,21 +2544,35 @@ def marker_expression_correlation_plot(df_P1_before, df_P1_after,
             alpha=0.8
         )
     # Identity line
+    min_val = min(df["before"].min(), df["after"].min())
     max_val = max(df["before"].max(), df["after"].max())
-    plt.plot([0,max_val],[0,max_val], linestyle="--", color="grey")
-    
+    plt.plot([min_val, max_val], [min_val, max_val], linestyle="--", color="grey")
+
+    # Annotate outliers — markers furthest from identity line
+    df["residual"] = (df["after"] - df["before"]).abs()
+    n_label = min(5, len(df))
+    outliers = df.nlargest(n_label, "residual")
+    ax_curr = plt.gca()
+    for _, row in outliers.iterrows():
+        ax_curr.annotate(
+            row["marker"],
+            xy=(row["before"], row["after"]),
+            xytext=(6, 4), textcoords="offset points",
+            fontsize=8, fontweight='bold', color='#2C3E50',
+            arrowprops=dict(arrowstyle="-", color='#95A5A6', lw=0.8)
+        )
+
     plt.xlabel("Median expression before correction", fontsize=12, fontweight='bold', fontname='Arial', labelpad=12)
     plt.ylabel("Median expression after correction", fontsize=12, fontweight='bold', fontname='Arial', labelpad=12)
     plt.title(f"Marker expression preservation\nr = {r:.3f}", fontsize=14, fontweight='bold', fontname='Arial', pad=20)
-    
+
     plt.legend(fontsize=11, prop={'family': 'Arial', 'weight': 'bold'}, frameon=False)
     plt.grid(True, linestyle=':', alpha=0.3)
     plt.xticks(fontsize=10, fontweight='bold', fontname='Arial')
     plt.yticks(fontsize=10, fontweight='bold', fontname='Arial')
-    # sns.despine()
     plt.tight_layout()
     if save_dir:
-        plt.savefig(os.path.join(save_dir, "marker_expression_correlation.png"), dpi=300, bbox_inches='tight')
+        _savefig(os.path.join(save_dir, "marker_expression_correlation.png"), dpi=300, bbox_inches='tight')
     else:
         plt.show()
     plt.close()

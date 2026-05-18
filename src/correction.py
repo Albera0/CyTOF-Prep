@@ -3,28 +3,32 @@ import pandas as pd
 
 def time_correction(df, panel, ctx, window=500, slope_clip=(0.3, 3)):
     """
-    Applies time-drift correction to Cytometry data by normalizing markers against a stable reference.
-    
-    The function calculates a rolling median of 'stable_markers' (e.g., DNA) to identify signal
-    fluctuations over the acquisition time. It then derives a correction slope to adjust all 
-    biological markers, ensuring the signal remains stable across the run.
+    Applies cell-type-specific time-drift correction to CyTOF data.
+
+    For each (plate, sample, cell-type) group listed in ctx.celltype2correct, a rolling
+    median of the stable reference channel (e.g. DNA) is used to estimate the
+    acquisition-time signal drift. A per-cell slope is computed as
+    baseline / rolling_median and clipped to slope_clip, then multiplied into every
+    biological marker signal (adaptive thresholding via clipping).
 
     Args:
-        df (pd.DataFrame): Input data containing 'Time', 'plate', 'cell_type', markers, and metadata.
-        panel (str): The specific antibody panel to process.
-        ctx (CyTOFContext): Global configuration context containing 'meta_cols' and 'stable_marker'.
-        window (int): Size of the sliding window for rolling median calculation. Default is 500.
-        slope_clip (tuple): Range (min, max) to clip the correction slopes, preventing extreme adjustments.
+        df (pd.DataFrame): Input data containing 'Time', 'plate', 'celltypes',
+            biological markers, and metadata columns.
+        panel (str): The antibody panel to process.
+        ctx (CyTOFContext): Pipeline config with meta_cols, stable_marker,
+            celltype2correct, and optionally true_markers / celltypes / celltype_gating.
+        window (int): Rolling-median window size (cells). Clipped to [50, 0.8*n_cells].
+        slope_clip (tuple): (min, max) bounds for the correction slope.
 
     Returns:
-        pd.DataFrame: A copy of the input DataFrame with corrected marker values.
+        pd.DataFrame: Copy of the panel-filtered input with corrected marker values.
     """
     info_cols = ctx.meta_cols
     stable_marker = ctx.stable_marker
     celltype2correct = ctx.celltype2correct
 
-    if "cell_type" not in df.columns or not celltype2correct:
-        print("Required column 'cell_type' or configuration 'celltype2correct' missing. Skipping time correction.")
+    if "celltypes" not in df.columns or not celltype2correct:
+        print("[TIME] 'celltypes' column or celltype2correct missing — skipping time correction.")
         return df
 
     sample_group_col = "original_filename" if "original_filename" in df.columns else "sample_name"
@@ -33,36 +37,77 @@ def time_correction(df, panel, ctx, window=500, slope_clip=(0.3, 3)):
 
     stable_markers = stable_marker if isinstance(stable_marker, list) else [stable_marker]
     stable_markers = [c for c in df_panel.columns if c in stable_markers]
-    
-    # Markers to correct
-    markers_to_correct = [c for c in df_panel.columns if c not in info_cols + stable_markers + [sample_group_col]]
-    
-    print(f"Time Correction: Stable={stable_markers}, Targets={len(markers_to_correct)}")
+
+    # Build the exclusion set: metadata + stable channels + gate/flag columns.
+    # Gate columns (OmiqFilter-derived binary flags, ctx.celltypes, ctx.celltype_gating)
+    # must NOT be time-corrected — they are 0/1 labels, not continuous signal.
+    gate_cols = set()
+    if getattr(ctx, 'celltypes', None):
+        gate_cols.update(ctx.celltypes)
+    if getattr(ctx, 'celltype_gating', None):
+        gate_cols.update(ctx.celltype_gating)
+
+    exclude = set(info_cols + stable_markers + [sample_group_col, "celltypes"]) | gate_cols
+
+    # Restrict to true_markers when provided (biological signal only), otherwise fall
+    # back to all numeric non-excluded columns.
+    if getattr(ctx, 'true_markers', None):
+        markers_to_correct = [
+            c for c in ctx.true_markers
+            if c in df_panel.columns and c not in exclude
+            and pd.api.types.is_numeric_dtype(df_panel[c])
+        ]
+    else:
+        markers_to_correct = [
+            c for c in df_panel.columns
+            if c not in exclude and pd.api.types.is_numeric_dtype(df_panel[c])
+        ]
+
+    print(f"[TIME] Stable={stable_markers} | Targets={len(markers_to_correct)} markers")
+
+    # Validate that cell type names match before starting the heavy loop
+    actual_types = set(df_panel['celltypes'].dropna().unique())
+    matched_types = actual_types & set(celltype2correct)
+    unmatched = set(celltype2correct) - actual_types
+    if not matched_types:
+        print(f"[WARN-TIME] No cell types in celltype2correct match the data!")
+        print(f"  celltype2correct : {sorted(celltype2correct)}")
+        print(f"  actual celltypes : {sorted(actual_types)}")
+        print(f"  → Time correction will be a no-op. Check your config.")
+    elif unmatched:
+        print(f"[TIME] {len(unmatched)} celltype2correct entries not found in data (will be skipped): {sorted(unmatched)}")
+
+    n_corrected_cells = 0
 
     for plate, df_plate in df_panel.groupby('plate'):
         print(f"\n[TIME] Plate={plate} | n_cells={len(df_plate)}")
         for sample, df_sample in df_plate.groupby(sample_group_col):
-            print(f"[TIME]   Sample={sample} ({sample_group_col}) | n={len(df_sample)}")
-            for celltype, df_cell in df_sample.groupby('cell_type'):
+            print(f"[TIME]   Sample={sample} | n={len(df_sample)}")
+            for celltype, df_cell in df_sample.groupby('celltypes'):
                 if celltype not in celltype2correct:
                     continue
-                
-                # Standard Paper Approach: Fixed window
+
+                # Adaptive window: bounded by [50, 80% of group size], always odd
                 cell_specific_window = min(window, int(len(df_cell) * 0.8))
                 cell_specific_window = max(50, cell_specific_window)
-                if cell_specific_window % 2 == 0: cell_specific_window += 1
+                if cell_specific_window % 2 == 0:
+                    cell_specific_window += 1
 
                 print(f"[TIME]     CellType={celltype} | n={len(df_cell)} | window={cell_specific_window}")
 
-                # 1. Sort by time for rolling calculation
-                df_cell_sorted = df_cell.sort_values('Time')
-                
-                # 2. Rolling median on ORIGINAL values
-                df_cell_sorted[stable_markers] = df_cell_sorted[stable_markers].apply(pd.to_numeric, errors='coerce')
-                runmeds = df_cell_sorted[stable_markers].rolling(window=cell_specific_window, center=True, min_periods=1).median()
+                # 1. Sort by acquisition time
+                df_cell_sorted = df_cell.sort_values('Time').astype("float", errors='ignore')
+
+                # 2. Rolling median of the stable channel
+                df_cell_sorted[stable_markers] = df_cell_sorted[stable_markers].apply(
+                    pd.to_numeric, errors='coerce'
+                )
+                runmeds = df_cell_sorted[stable_markers].rolling(
+                    window=cell_specific_window, center=True, min_periods=1
+                ).median()
                 baseline = df_cell_sorted[stable_markers].mean().values
 
-                # 3. Calculate slopes
+                # 3. Per-cell correction slope = baseline / rolling_median (clipped)
                 slopes_df = pd.DataFrame(index=df_cell_sorted.index)
                 for i, m in enumerate(stable_markers):
                     smoothed = runmeds[m].values
@@ -72,11 +117,20 @@ def time_correction(df, panel, ctx, window=500, slope_clip=(0.3, 3)):
                     s = np.clip(s, slope_clip[0], slope_clip[1])
                     slopes_df[m] = s
 
-                slope_mean = slopes_df.mean(axis=1).values # matching sorted order
+                # Average slope across stable markers (handles multi-channel references)
+                slope_mean = slopes_df.mean(axis=1).astype(float).values
 
-                # 4. Apply correction using index-aware alignment
+                # 4. Apply slope to biological markers and stable channel
                 for m in markers_to_correct + stable_markers:
-                    df_corrected.loc[df_cell_sorted.index, m] = df_cell_sorted[m].values * slope_mean
+                    col_values = pd.to_numeric(df_cell_sorted[m], errors='coerce').values
+                    df_corrected.loc[df_cell_sorted.index, m] = col_values * slope_mean
+
+                n_corrected_cells += len(df_cell)
+
+    frac = n_corrected_cells / max(len(df_panel), 1) * 100
+    print(f"\n[TIME] Corrected {n_corrected_cells}/{len(df_panel)} cells ({frac:.1f}%)")
+    if n_corrected_cells == 0 and matched_types:
+        print("[WARN-TIME] Correction produced no output — check that 'celltypes' values are not all NaN.")
 
     return df_corrected
 
@@ -118,8 +172,14 @@ def build_reference_stats(df, markers, anchor_sample, dataset, panel, ctx):
     ].copy()
     print(f"\n[REF] Building reference: dataset={dataset} panel={panel} anchor={anchor_sample}")
     print(f"[REF] n_cells={len(df_ref)}")
+    if df_ref.empty:
+        print(f"[WARN-REF] No cells found for ref_plate={ctx.ref_plate!r} anchor={anchor_sample!r}. Returning empty ref_stats.")
+        return {}
     ref_stats = {}
     for m in markers:
+        if m not in df_ref.columns:
+            print(f"[WARN-REF] marker '{m}' not in reference data columns. Skipping.")
+            continue
         # Calculate the proportion of zeros for this marker
         zero_prop = np.mean(df_ref[m].values == 0)
         # Lower quantile, avoid zero inflation

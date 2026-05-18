@@ -19,6 +19,29 @@ from FlowCytometryTools import FCMeasurement
 from glob import glob
 from collections import defaultdict
 
+
+_BEFORE_COLOR = "#F56455"
+_AFTER_COLOR  = "#15134B"
+_PANEL1_COLOR = "#A1B654"
+_PANEL2_COLOR = "#B8321A"
+
+_PLATE_COLORS = [
+    "#2B9B81", "#F4C40F", "#FBE183", "#D8443C", "#9B3441",
+    "#DE597C", "#1F6E9C", "#E87B89", "#E6A2A6", "#AA7AA1",
+    "#9F5691", "#633372", "#92C051", "#FE9B00", "#FBE183",
+]
+
+
+def _savefig(save_path, fig=None, **kwargs):
+    """Save figure as PNG and SVG."""
+    _fig = fig if fig is not None else plt.gcf()
+    _fig.savefig(save_path, **kwargs)
+    svg_path = os.path.splitext(save_path)[0] + '.svg'
+    svg_kw = {k: v for k, v in kwargs.items() if k != 'dpi'}
+    svg_kw.setdefault('bbox_inches', 'tight')
+    _fig.savefig(svg_path, **svg_kw)
+
+
 def get_indexed_files(directory, dataset_filter, panel_filter, metadata_df, exclude_uncorrected=False):
     """
     Scans a directory for CyTOF files and indexes them by plate based on metadata.
@@ -120,7 +143,7 @@ def load_config(path):
 
 
 
-def get_config(config_path):
+def get_config(config_path=None, config_dict=None):
     """
     Load and validate config for CyTOF pipeline.
 
@@ -131,8 +154,10 @@ def get_config(config_path):
 
     Parameters
     ----------
-    config_path : str
+    config_path : str, optional
         Path to config.json
+    config_dict : dict, optional
+        Dictionary containing configuration
 
     Returns
     -------
@@ -140,7 +165,12 @@ def get_config(config_path):
         Cleaned and validated config
     """
 
-    config = load_config(config_path)
+    if config_dict is not None:
+        config = config_dict.copy()
+    elif config_path is not None:
+        config = load_config(config_path)
+    else:
+        raise ValueError("Either config_path or config_dict must be provided.")
 
     # required fields check
     required_keys = [
@@ -162,6 +192,7 @@ def get_config(config_path):
     # optional fields
     config["celltype_gating"] = config.get("celltype_gating", [])
     config["metal_to_marker"] = config.get("metal_to_marker", {})
+    config["pheno_markers"]   = config.get("pheno_markers", None)
 
     # ensure output dir exists
     os.makedirs(config["output_dir"], exist_ok=True)
@@ -189,6 +220,7 @@ class CyTOFContext:
         self.stable_marker = config["stable_marker"]
         self.true_markers = config["true_markers"]
         self.metal_to_marker = config.get("metal_to_marker", {})
+        self.pheno_markers = config.get("pheno_markers", None)
 
 
 # Utils
@@ -278,31 +310,80 @@ def add_metadata(df, file_path, metadata_df=None, ctx=None):
     if "original_filename" not in df.columns:
         df["original_filename"] = file_name
 
-    # Define logical reordering
-    all_meta_order = ["original_filename"] + target_meta_cols
-    actual_meta = [c for c in all_meta_order if c in df.columns]
-    actual_markers = [c for c in df.columns if c not in actual_meta]
-    
+    # Define logical reordering — deduplicate while preserving order
+    _seen: set = set()
+    all_meta_order = [
+        c for c in ["original_filename"] + target_meta_cols
+        if not (c in _seen or _seen.add(c))  # type: ignore[func-returns-value]
+    ]
+    actual_meta    = [c for c in all_meta_order if c in df.columns]
+    actual_markers = [c for c in df.columns if c not in set(actual_meta)]
+
     return df[actual_meta + actual_markers]
 
-def assign_cell_type(df, ctx):
+def assign_cell_type(df, ctx, gating_cols=None):
     """
-    Assign cell type labels based on marker columns; only keep CD45 positive cells.
+    Assign cell type labels from binary flag columns; only keep CD45 positive cells.
+
+    Args:
+        df: cell DataFrame (post-harmonization).
+        ctx: CyTOFContext.
+        gating_cols: explicit list of column names (already in df) to use as cell type
+            flags. When provided, ctx.celltype_gating is ignored. When None, falls back
+            to ctx.celltype_gating (checking both the clean name and OmiqFilter variant).
     """
-    if not ctx.celltype_gating:
-        print("[INFO] Skip cell type assignment (no gating provided)")
+    if "CD45pos" in df.columns:
+        cd45 = pd.to_numeric(df["CD45pos"], errors="coerce").fillna(0)
+        df = df[cd45 > 0].copy()
+
+    if gating_cols is not None:
+        # Use the explicitly provided column names directly
+        present = [c for c in gating_cols if c in df.columns]
+    else:
+        if not ctx.celltype_gating:
+            print("[INFO] Skip cell type assignment (no gating provided)")
+            return df
+        # Match ctx.celltype_gating names against df, also trying the OmiqFilter variant
+        present = []
+        for ct in ctx.celltype_gating:
+            if ct in df.columns:
+                present.append(ct)
+            elif f"OmiqFilter{ct}" in df.columns:
+                present.append(f"OmiqFilter{ct}")
+
+    if not present:
+        print("[INFO] Skip cell type assignment (no gating columns found in data)")
         return df
 
-    cd45 = pd.to_numeric(df.get("CD45pos", 0), errors="coerce").fillna(0)
-    df = df[cd45 > 0].copy()  # Keep only CD45 positive cells
+    # Show a sample value per gating column so the user can verify format
+    for col in present[:3]:
+        sample = df[col].dropna().iloc[0] if not df[col].dropna().empty else "N/A"
+        print(f"[GATE] '{col}' sample value: {repr(sample)} (type={type(sample).__name__})")
+
+    def _is_positive(val):
+        """Return True for any truthy gate membership value (1, 1.0, True, 'True', 'true', etc.)."""
+        if val is None:
+            return False
+        if isinstance(val, bool):
+            return val
+        try:
+            return float(val) > 0
+        except (ValueError, TypeError):
+            return str(val).strip().lower() == "true"
+
     def get_type(row):
-        # Iterate through all cell type marker columns, return the type if value is 1
-        for ct in ctx.celltype_gating:
-            if ct in df.columns and pd.to_numeric(row.get(ct, 0), errors="coerce") > 0:
-                return ct
+        for col in present:
+            if _is_positive(row.get(col)):
+                return col
         return None
-    df["cell_type"] = df.apply(get_type, axis=1)
-    return df[df["cell_type"].notna()]  # Keep only cells with assigned type
+
+    df["celltypes"] = df.apply(get_type, axis=1)
+    n_assigned = df["celltypes"].notna().sum()
+    if n_assigned == 0:
+        print(f"[WARN] 0 cells assigned a cell type from columns: {present}")
+        print(f"       Check that column values represent gate membership (1, True, etc.)")
+        return df
+    return df[df["celltypes"].notna()]
 
 def enforce_schema(df, ctx):
     """
@@ -335,7 +416,7 @@ def enforce_schema(df, ctx):
     extra_markers = [c for c in valid_data_cols if c not in ctx.true_markers]
     
     # Reorder: Meta + Correction Markers + Extra Markers
-    full_df = df[meta + markers + extra_markers].copy()
+    full_df = df[meta + ["celltypes"] + markers + extra_markers].copy()
     
     # Return ONLY 2 values as expected by the rest of the pipeline
     return full_df, markers
@@ -346,7 +427,7 @@ def generate_and_save_colors(
     save_path,
     metadata_path=None,
     df=None,
-    celltype_col="cell_type",
+    celltype_col="celltypes",
     panel_col="panel",
     plate_col="plate",
     sample_col="sample_name",
@@ -701,7 +782,7 @@ def plot_variance_bar(p1_before, p1_after, p2_before=None, p2_after=None, save_p
     age_groups = df['condition'].unique()
     factors = [f for f in df['factor'].unique() if f != 'Residual']
     n_factors = len(factors)
-    colors = sns.color_palette("Set2", n_colors=len(age_groups))
+    colors = [_PLATE_COLORS[i % len(_PLATE_COLORS)] for i in range(len(age_groups))]
 
     # Dynamic figure width based on number of factors and panels
     fig_width = max(8 if not has_p2 else 12, len(factors) * 0.8)
@@ -738,7 +819,7 @@ def plot_variance_bar(p1_before, p1_after, p2_before=None, p2_after=None, save_p
 
     plt.tight_layout()
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        _savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"  [SAVE] Variance bar plot saved to: {save_path}")
     else:
         plt.show()
@@ -751,7 +832,7 @@ def plot_variance_bar(p1_before, p1_after, p2_before=None, p2_after=None, save_p
 def identify_shared_markers(df, info_col):
 
     # Define metadata columns to exclude
-    meta = ['panel','plate','sample_name','cell_type',
+    meta = ['panel','plate','sample_name','celltypes',
                     'dataset','OmiqFilter','Event_length','Time','Anchor','condition', 'original_filename']
 
     panels = df[info_col].unique()
@@ -789,7 +870,7 @@ def plot_signal_distributions(df_before, df_after, panel, markers, save_dir, low
         return
 
     # Color palette for all plates
-    palette = sns.color_palette("tab20", len(plates))
+    palette = [_PLATE_COLORS[i % len(_PLATE_COLORS)] for i in range(len(plates))]
     plate_colors = dict(zip(plates, palette))
 
     # Calculate global marker ranges using a sample for speed
@@ -856,15 +937,15 @@ def plot_signal_distributions(df_before, df_after, panel, markers, save_dir, low
 
         if save_dir is not None:
             save_path = os.path.join(save_dir, f"{panel}_{save_name}_distribution.png")
-            fig.savefig(save_path, dpi=120, bbox_inches='tight') # Lower DPI for speed
+            _savefig(save_path, fig=fig, dpi=120, bbox_inches='tight')
             plt.close(fig)
             print(f"Saved: {save_path}")
         else:
             plt.show()
             plt.close(fig)
 
-    draw_plots(df_before, "Before Correction", "BeforeCorrection")
-    draw_plots(df_after, "After Correction", "AfterCorrection")
+    draw_plots(df_before, "Before", "Before")
+    draw_plots(df_after, "After", "After")
 
 
 
