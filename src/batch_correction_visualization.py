@@ -351,12 +351,94 @@ def visualize_anchor_celltype_across_plates(
             plt.close(fig)
 
 
+def _balanced_paired_anchor_subset(
+    df_before,
+    df_after,
+    anchor_name,
+    sample_col="sample_name",
+    group_cols=("plate",),
+    max_cells=50000,
+    random_state=42,
+):
+    """Return the same anchor-cell rows before/after, balanced across groups."""
+    required = {sample_col, *group_cols}
+    missing_before = required - set(df_before.columns)
+    missing_after = required - set(df_after.columns)
+    if missing_before or missing_after:
+        raise ValueError(
+            "Anchor UMAP requires matching metadata columns. "
+            f"Missing before={sorted(missing_before)}, after={sorted(missing_after)}"
+        )
+
+    def _metadata_groups(df):
+        return {
+            tuple(str(value) for value in row)
+            for row in df[list(group_cols)].drop_duplicates().itertuples(
+                index=False, name=None
+            )
+        }
+
+    expected_before = _metadata_groups(df_before)
+    expected_after = _metadata_groups(df_after)
+    if expected_before != expected_after:
+        raise ValueError(
+            "Before/after data do not contain the same plate/panel groups."
+        )
+
+    before = df_before[df_before[sample_col].astype(str) == str(anchor_name)].copy()
+    after = df_after[df_after[sample_col].astype(str) == str(anchor_name)].copy()
+    anchor_groups = _metadata_groups(before) & _metadata_groups(after)
+    missing_anchor_groups = sorted(expected_before - anchor_groups)
+    if missing_anchor_groups:
+        print(
+            f"[UMAP][WARN] Anchor sample {anchor_name!r} is unavailable in "
+            f"plate/panel groups {missing_anchor_groups}; those groups are excluded."
+        )
+    # CytoNorm exports can reorder files/groups, so the global DataFrame index is
+    # not a stable cell identifier. Pair rows by their position *within* each
+    # metadata group; conversion/correction preserves the event order per file.
+    before_groups = before.groupby(list(group_cols), observed=True, sort=True)
+    after_groups = after.groupby(list(group_cols), observed=True, sort=True)
+    group_keys = sorted(set(before_groups.groups) & set(after_groups.groups), key=str)
+    if not group_keys:
+        raise ValueError(f"No plate groups found for anchor sample {anchor_name!r}.")
+
+    rng = np.random.default_rng(random_state)
+    paired_sizes = [
+        min(len(before_groups.get_group(key)), len(after_groups.get_group(key)))
+        for key in group_keys
+    ]
+    n_per_group = int(min(paired_sizes))
+    if max_cells is not None:
+        n_per_group = min(n_per_group, max(1, int(max_cells) // len(group_keys)))
+    before_selected = []
+    after_selected = []
+    for key in group_keys:
+        before_group = before_groups.get_group(key).reset_index(drop=True)
+        after_group = after_groups.get_group(key).reset_index(drop=True)
+        paired_size = min(len(before_group), len(after_group))
+        chosen_positions = rng.choice(paired_size, size=n_per_group, replace=False)
+        before_selected.append(before_group.iloc[chosen_positions])
+        after_selected.append(after_group.iloc[chosen_positions])
+
+    before = pd.concat(before_selected, ignore_index=True)
+    after = pd.concat(after_selected, ignore_index=True)
+    print(
+        f"[UMAP] Anchor-only: {anchor_name!r} | groups={len(group_keys)} | "
+        f"cells/group={n_per_group} | cells/state={len(before)}"
+    )
+    return before, after
+
+
 # UMAP visualization focused on plate effects, showing how samples cluster by plate before and after correction
 def umap_plate_effect(
     df_before,
     df_after,
     markers,
     plate_col="plate",
+    celltype_col="celltypes",
+    anchor_name=None,
+    sample_col="sample_name",
     n_pcs=20,
     n_neighbors=30,
     min_dist=0.3,
@@ -368,6 +450,9 @@ def umap_plate_effect(
 ):
     """
     Standardizes 'Before' and 'After' data to plot them in the same UMAP space focused on batches.
+
+    When anchor_name is provided, only paired cells from that shared anchor sample
+    are used, with equal maximum sampling per plate.
     
     If 'Before' correction cells cluster strongly by 'Plate', it indicates a high batch effect.
     The 'After' plot should show better mixing of colors (plates) if correction was successful.
@@ -378,26 +463,59 @@ def umap_plate_effect(
     rng = np.random.default_rng(random_state)
     markers = [m for m in markers if m in df_before.columns and m in df_after.columns and pd.api.types.is_numeric_dtype(df_before[m]) and pd.api.types.is_numeric_dtype(df_after[m])]
 
-    # Subsample for speed
-    if df_before.shape[0] > subsample:
+    if anchor_name is not None:
+        df_before, df_after = _balanced_paired_anchor_subset(
+            df_before,
+            df_after,
+            anchor_name=anchor_name,
+            sample_col=sample_col,
+            group_cols=(plate_col,),
+            max_cells=subsample,
+            random_state=random_state,
+        )
+    # Subsample for speed when no anchor was requested.
+    elif df_before.shape[0] > subsample:
         idx_before = rng.choice(df_before.shape[0], subsample, replace=False)
         df_before = df_before.iloc[idx_before].reset_index(drop=True)
-    if df_after.shape[0] > subsample:
+    if anchor_name is None and df_after.shape[0] > subsample:
         idx_after = rng.choice(df_after.shape[0], subsample, replace=False)
         df_after = df_after.iloc[idx_after].reset_index(drop=True)
 
-    # Marker matrices
-    X_before = df_before[markers].fillna(0).to_numpy(dtype=float)
-    X_after  = df_after[markers].fillna(0).to_numpy(dtype=float)
+    # Marker matrices. UMAP markers must be genuinely observed in the selected
+    # panel/anchor subset; silently replacing a panel-mismatched all-NaN marker
+    # with zero would hide an upstream marker-selection error.
+    X_before = df_before[markers].to_numpy(dtype=float)
+    X_after = df_after[markers].to_numpy(dtype=float)
+    invalid_before = ~np.isfinite(X_before)
+    invalid_after = ~np.isfinite(X_after)
+    if invalid_before.any() or invalid_after.any():
+        bad_markers = [
+            marker for i, marker in enumerate(markers)
+            if invalid_before[:, i].any() or invalid_after[:, i].any()
+        ]
+        raise ValueError(
+            "UMAP markers contain missing or non-finite values in the selected "
+            f"panel/anchor subset: {bad_markers}"
+        )
 
     # AnnData
-    adata_before = ad.AnnData(df_before[markers].fillna(0).to_numpy(dtype=float))
-    adata_before.obs[plate_col] = df_before[plate_col].values
+    adata_before = ad.AnnData(X_before)
+    adata_before.obs[plate_col] = df_before[plate_col].astype(str).values
     adata_before.obs["status"] = "Before"
 
-    adata_after = ad.AnnData(df_after[markers].fillna(0).to_numpy(dtype=float))
-    adata_after.obs[plate_col] = df_after[plate_col].values
+    adata_after = ad.AnnData(X_after)
+    adata_after.obs[plate_col] = df_after[plate_col].astype(str).values
     adata_after.obs["status"] = "After"
+
+    do_celltype_plot = (
+        celltype_col in df_before.columns
+        and celltype_col in df_after.columns
+        and not df_before[celltype_col].isna().all()
+        and not df_after[celltype_col].isna().all()
+    )
+    if do_celltype_plot:
+        adata_before.obs[celltype_col] = df_before[celltype_col].fillna("unknown").astype(str).values
+        adata_after.obs[celltype_col] = df_after[celltype_col].fillna("unknown").astype(str).values
 
     # Preprocessing + PCA on BEFORE (to get PCs)
     sc.pp.scale(adata_before, max_value=10)
@@ -405,10 +523,15 @@ def umap_plate_effect(
     
     # Preprocessing + PCA project AFTER using BEFORE's scale and PCs
     # Manually scale after using before's mean/std
-    mean_b = df_before[markers].mean()
-    std_b = df_before[markers].std()
-    X_after_scaled = (df_after[markers].fillna(0) - mean_b) / (std_b + 1e-6)
-    X_after_scaled = np.clip(X_after_scaled.to_numpy(), -10, 10) # Match sc.pp.scale(max_value=10)
+    before_values = df_before[markers].astype(float)
+    after_values = df_after[markers].astype(float)
+    mean_b = before_values.mean()
+    std_b = before_values.std().replace([np.inf, -np.inf, 0], 1.0).fillna(1.0)
+    X_after_scaled = (after_values - mean_b) / std_b
+    X_after_scaled = np.nan_to_num(
+        X_after_scaled.to_numpy(dtype=float), nan=0.0, posinf=10.0, neginf=-10.0
+    )
+    X_after_scaled = np.clip(X_after_scaled, -10, 10) # Match sc.pp.scale(max_value=10)
     
     # Project AFTER onto BEFORE's PCA space
     adata_after.obsm["X_pca"] = X_after_scaled @ adata_before.varm["PCs"]
@@ -430,11 +553,29 @@ def umap_plate_effect(
         _plates = sorted(str(p) for p in _adata.obs[plate_col].unique())
         _adata.uns[f"{plate_col}_colors"] = [plate_palette[p] for p in _plates]
 
-    fig, axes = plt.subplots(2, 1, figsize=(8, 12))
-    sc.pl.umap(adata_before, color=plate_col, ax=axes[0], show=False, size=size, alpha=alpha)
-    axes[0].set_title("Before - Plate", fontsize=16, fontweight='bold')
-    sc.pl.umap(adata_after, color=plate_col, ax=axes[1], show=False, size=size, alpha=alpha)
-    axes[1].set_title("After - Plate", fontsize=16, fontweight='bold')
+    if do_celltype_plot:
+        all_celltypes = sorted(
+            set(adata_before.obs[celltype_col].astype(str).unique())
+            | set(adata_after.obs[celltype_col].astype(str).unique())
+        )
+        celltype_palette = _build_celltype_palette(all_celltypes)
+        for _adata in (adata_before, adata_after):
+            _celltypes = sorted(str(c) for c in _adata.obs[celltype_col].unique())
+            _adata.uns[f"{celltype_col}_colors"] = [
+                celltype_palette.get(c, "#808080") for c in _celltypes
+            ]
+
+    n_cols = 2 if do_celltype_plot else 1
+    fig, axes = plt.subplots(2, n_cols, figsize=(8 * n_cols, 12), squeeze=False)
+    sc.pl.umap(adata_before, color=plate_col, ax=axes[0, 0], show=False, size=size, alpha=alpha)
+    axes[0, 0].set_title("Before - Plate", fontsize=16, fontweight='bold')
+    sc.pl.umap(adata_after, color=plate_col, ax=axes[1, 0], show=False, size=size, alpha=alpha)
+    axes[1, 0].set_title("After - Plate", fontsize=16, fontweight='bold')
+    if do_celltype_plot:
+        sc.pl.umap(adata_before, color=celltype_col, ax=axes[0, 1], show=False, size=size, alpha=alpha)
+        axes[0, 1].set_title("Before - Cell type", fontsize=16, fontweight='bold')
+        sc.pl.umap(adata_after, color=celltype_col, ax=axes[1, 1], show=False, size=size, alpha=alpha)
+        axes[1, 1].set_title("After - Cell type", fontsize=16, fontweight='bold')
     
     plt.tight_layout()
     if save_path:
@@ -708,6 +849,7 @@ def compute_emd_mad(
     df_raw,
     df_corr,
     markers,
+    ref_plate,
     plate_col="plate",
     cluster_col=None,
     anchor=None,
@@ -725,6 +867,9 @@ def compute_emd_mad(
         df_raw (pd.DataFrame): Raw data before correction.
         df_corr (pd.DataFrame): Data after batch correction.
         markers (list): List of biological markers to evaluate.
+        ref_plate: Plate used as the correction reference. Every other plate is
+            compared directly with this plate; non-reference plates are not
+            compared with one another.
         plate_col (str): Column name for technical plate/batch identifier.
         cluster_col (str, optional): Pre-existing cluster column. If None, SOM will be trained.
         anchor (str, optional): If provided, calculations only use cells from this specific sample.
@@ -784,51 +929,60 @@ def compute_emd_mad(
         df_raw_nodes["EMD_Cluster"]  = node_raw
         clusters = sorted(df_corr_nodes["EMD_Cluster"].unique())
 
-    plates = df_raw_nodes[plate_col].unique()
+    plates = list(df_raw_nodes[plate_col].dropna().unique())
+    corr_plates = set(df_corr_nodes[plate_col].dropna().unique())
+    if ref_plate not in plates or ref_plate not in corr_plates:
+        raise ValueError(
+            f"Reference plate {ref_plate!r} must be present in both raw and corrected "
+            f"data after anchor filtering. Raw plates: {plates}; corrected plates: {sorted(corr_plates, key=str)}"
+        )
+    comparison_plates = [plate for plate in plates if plate != ref_plate and plate in corr_plates]
+    if not comparison_plates:
+        raise ValueError(f"No non-reference plates are available to compare with {ref_plate!r}.")
 
-    # Pairwise EMD between batches
+    # Reference-based EMD: compare every target plate directly with ref_plate.
     emd_results = []
-    for i, plate1 in enumerate(plates):
-        for plate2 in plates[i+1:]:  # all unique pairs
-            raw1 = df_raw_nodes[df_raw_nodes[plate_col] == plate1]
-            raw2 = df_raw_nodes[df_raw_nodes[plate_col] == plate2]
-            corr1 = df_corr_nodes[df_corr_nodes[plate_col] == plate1]
-            corr2 = df_corr_nodes[df_corr_nodes[plate_col] == plate2]
+    for plate2 in comparison_plates:
+        plate1 = ref_plate
+        raw1 = df_raw_nodes[df_raw_nodes[plate_col] == plate1]
+        raw2 = df_raw_nodes[df_raw_nodes[plate_col] == plate2]
+        corr1 = df_corr_nodes[df_corr_nodes[plate_col] == plate1]
+        corr2 = df_corr_nodes[df_corr_nodes[plate_col] == plate2]
 
-            for cluster in clusters:
-                raw_node1 = raw1[raw1["EMD_Cluster"] == cluster]
-                raw_node2 = raw2[raw2["EMD_Cluster"] == cluster]
-                corr_node1 = corr1[corr1["EMD_Cluster"] == cluster]
-                corr_node2 = corr2[corr2["EMD_Cluster"] == cluster]
+        for cluster in clusters:
+            raw_node1 = raw1[raw1["EMD_Cluster"] == cluster]
+            raw_node2 = raw2[raw2["EMD_Cluster"] == cluster]
+            corr_node1 = corr1[corr1["EMD_Cluster"] == cluster]
+            corr_node2 = corr2[corr2["EMD_Cluster"] == cluster]
 
-                if raw_node1.shape[0] < 10 or raw_node2.shape[0] < 10:
-                    continue
-                if corr_node1.shape[0] < 10 or corr_node2.shape[0] < 10:
-                    continue
+            if raw_node1.shape[0] < 10 or raw_node2.shape[0] < 10:
+                continue
+            if corr_node1.shape[0] < 10 or corr_node2.shape[0] < 10:
+                continue
 
-                for marker in markers:
-                    x_raw = rng.choice(raw_node1[marker].dropna().values, 
-                                        min(len(raw_node1), n_sample), replace=False)
-                    y_raw = rng.choice(raw_node2[marker].dropna().values,
-                                        min(len(raw_node2), n_sample), replace=False)
-                    x_corr = rng.choice(corr_node1[marker].dropna().values,
-                                        min(len(corr_node1), n_sample), replace=False)
-                    y_corr = rng.choice(corr_node2[marker].dropna().values,
-                                        min(len(corr_node2), n_sample), replace=False)
+            for marker in markers:
+                x_raw = rng.choice(raw_node1[marker].dropna().values,
+                                   min(len(raw_node1), n_sample), replace=False)
+                y_raw = rng.choice(raw_node2[marker].dropna().values,
+                                   min(len(raw_node2), n_sample), replace=False)
+                x_corr = rng.choice(corr_node1[marker].dropna().values,
+                                    min(len(corr_node1), n_sample), replace=False)
+                y_corr = rng.choice(corr_node2[marker].dropna().values,
+                                    min(len(corr_node2), n_sample), replace=False)
 
-                    emd_raw = wasserstein_distance(x_raw, y_raw)
-                    emd_corr = wasserstein_distance(x_corr, y_corr)
-                    emd_reduction = emd_raw - emd_corr
+                emd_raw = wasserstein_distance(x_raw, y_raw)
+                emd_corr = wasserstein_distance(x_corr, y_corr)
+                emd_reduction = emd_raw - emd_corr
 
-                    emd_results.append({
-                        "plate1": plate1,
-                        "plate2": plate2,
-                        "SOM_node": cluster,
-                        "marker": marker,
-                        "EMD_raw": emd_raw,
-                        "EMD_corr": emd_corr,
-                        "EMD_reduction": emd_reduction
-                    })
+                emd_results.append({
+                    "plate1": plate1,
+                    "plate2": plate2,
+                    "SOM_node": cluster,
+                    "marker": marker,
+                    "EMD_raw": emd_raw,
+                    "EMD_corr": emd_corr,
+                    "EMD_reduction": emd_reduction
+                })
 
     emd_df = pd.DataFrame(emd_results)
 
@@ -887,7 +1041,7 @@ def plot_emd(emd_df, mad_score, save_path=None):
     Main EMD visualization suite.
     
     1. Global KDE Plot: Shows the overall shift in distribution (Raw vs Corrected).
-    2. Boxplots per Plate: Statistical comparison of EMD values for all markers.
+    2. Boxplots per target plate: EMD to the reference plate for all markers.
     3. Per-Plate KDE: Detailed look at individual batch reduction efficiency.
     """
 
@@ -941,69 +1095,73 @@ def plot_emd(emd_df, mad_score, save_path=None):
         plt.show()
     plt.close()
 
-    # GROUPED SPLIT VIOLIN PLOT
+    # PER-TARGET-PLATE BOXPLOT. Each EMD row is ref_plate -> target plate,
+    # so assign it only to plate2 instead of duplicating it under both plates.
     emd_long = []
-    # Combine plate1 and plate2 data for a comprehensive per-plate view
     for _, row in emd_df.iterrows():
-        emd_long.append({'Plate': row['plate1'], 'EMD': row['EMD_raw'], 'Condition': 'Before', 'Marker': row['marker']})
-        emd_long.append({'Plate': row['plate1'], 'EMD': row['EMD_corr'], 'Condition': 'After', 'Marker': row['marker']})
-        # If plate1 != plate2 (cross-plate internal comparison)
-        if row['plate1'] != row['plate2']:
-            emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_raw'], 'Condition': 'Before', 'Marker': row['marker']})
-            emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_corr'], 'Condition': 'After', 'Marker': row['marker']})
+        emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_raw'], 'Condition': 'Before', 'Marker': row['marker']})
+        emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_corr'], 'Condition': 'After', 'Marker': row['marker']})
     
     plot_data = pd.DataFrame(emd_long)
     plates_sorted = sorted(plot_data['Plate'].unique(), key=lambda x: str(x))
     
-    plt.figure(figsize=(max(10, len(plates_sorted) * 2.5), 7))
-    sns.set_theme(style="white", font_scale=1.3)
-
     raw_color_v = _BEFORE_COLOR
     corr_color_v = _AFTER_COLOR
+    single_target = len(plates_sorted) == 1
+    figure_size = (6.8, 6.2) if single_target else (max(10, len(plates_sorted) * 2.5), 7)
+    fig, ax = plt.subplots(figsize=figure_size)
+    sns.set_theme(style="white", font_scale=1.3)
 
-    ax = sns.boxplot(
+    sns.boxplot(
         data=plot_data,
         x='Plate',
         y='EMD',
         hue='Condition',
         palette={'Before': raw_color_v, 'After': corr_color_v},
-        width=0.6,
+        width=0.30,
         linewidth=1.2,
         showfliers=False,
         order=plates_sorted,
+        hue_order=['Before', 'After'],
         boxprops=dict(edgecolor="#4D5656"),
         whiskerprops=dict(color="#4D5656"),
         capprops=dict(color="#4D5656"),
-        medianprops=dict(color="#2C3E50", linewidth=1.5)
+        medianprops=dict(color="#2C3E50", linewidth=1.5),
+        ax=ax,
     )
 
-    # Add stripplot (markers) with jitter and transparency
-    # Subsample the markers
     max_points_per_box = 500
-    df_stripplot = pd.DataFrame()
+    strip_parts = []
     for plate in plot_data['Plate'].unique():
         for condition in plot_data['Condition'].unique():
             subset = plot_data[(plot_data['Plate'] == plate) & (plot_data['Condition'] == condition)]
             if len(subset) > max_points_per_box:
                 subset = subset.sample(n=max_points_per_box, random_state=42)
-            df_stripplot = pd.concat([df_stripplot, subset])
+            strip_parts.append(subset)
+    df_stripplot = pd.concat(strip_parts, ignore_index=True)
 
-    sns.stripplot(
-        data=df_stripplot,
-        x='Plate',
-        y='EMD',
-        hue='Condition',
-        dodge=True,
-        jitter=0.1,
-        size=3.5,
-        alpha=0.4,
-        linewidth=0.5,
-        edgecolor='black',
-        order=plates_sorted,
-        hue_order=['Before', 'After'],
-        palette={'Before': _BEFORE_COLOR, 'After': _AFTER_COLOR},
-        legend=False
-    )
+    # Match point clouds to the narrowed hue boxes. Seaborn's stripplot uses
+    # its own fixed dodge span, which would leave points outside width=0.30.
+    rng = np.random.default_rng(42)
+    condition_offsets = {'Before': -0.075, 'After': 0.075}
+    condition_colors = {'Before': raw_color_v, 'After': corr_color_v}
+    for plate_idx, plate in enumerate(plates_sorted):
+        for condition in ['Before', 'After']:
+            values = df_stripplot.loc[
+                (df_stripplot['Plate'] == plate)
+                & (df_stripplot['Condition'] == condition),
+                'EMD',
+            ].to_numpy()
+            x = (
+                plate_idx
+                + condition_offsets[condition]
+                + rng.uniform(-0.055, 0.055, size=len(values))
+            )
+            ax.scatter(
+                x, values, s=12, alpha=0.4,
+                facecolor=condition_colors[condition],
+                edgecolor='black', linewidth=0.35, zorder=3,
+            )
 
     # Statistical annotation for each plate using FDR (BH) correction
     y_max_total = plot_data['EMD'].max()
@@ -1040,36 +1198,44 @@ def plot_emd(emd_df, mad_score, save_path=None):
             y_pos = local_max + (y_max_total * 0.05)
             h = y_max_total * 0.02
             
-            plt.plot([i - 0.2, i - 0.2, i + 0.2, i + 0.2], [y_pos, y_pos + h, y_pos + h, y_pos], lw=1.2, c='#2C3E50')
-            plt.text(i, y_pos + h, stars, ha='center', va='bottom', color='black', fontsize=12, fontweight='bold')
+            ax.plot([i - 0.15, i - 0.15, i + 0.15, i + 0.15], [y_pos, y_pos + h, y_pos + h, y_pos], lw=1.2, c='#2C3E50')
+            ax.text(i, y_pos + h, stars, ha='center', va='bottom', color='black', fontsize=12, fontweight='bold')
 
-    plt.title("Batch-to-Batch EMD Distribution per Plate", fontsize=18, fontweight='bold', pad=20)
-    plt.xticks(rotation=45, fontsize=14, fontweight='bold')
-    plt.ylabel("Earth Mover's Distance (EMD)", fontsize=16, fontweight='bold', labelpad=10)
-    plt.xlabel("Plate", fontsize=16, fontweight='bold', labelpad=10)
-    sns.despine()
-    plt.grid(axis='y', linestyle='--', alpha=0.2, color='grey')
-    plt.legend(title="Condition", frameon=True, facecolor='white', bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=14, title_fontsize=15, prop={'weight':'bold'})
-    
-    # Bold color for legend title
-    legend = plt.gca().get_legend()
+    reference_plate = emd_df['plate1'].iloc[0]
+    if single_target:
+        ax.set_title(
+            f"EMD Distribution: {plates_sorted[0]} vs {reference_plate}",
+            fontsize=17, fontweight='bold', pad=18,
+        )
+    else:
+        ax.set_title(
+            f"EMD to Reference Plate ({reference_plate}) per Target Plate",
+            fontsize=18, fontweight='bold', pad=20,
+        )
+    ax.tick_params(axis='x', labelrotation=0 if single_target else 45, labelsize=14)
+    for label in ax.get_xticklabels():
+        label.set_fontweight('bold')
+    ax.set_ylabel("Earth Mover's Distance (EMD)", fontsize=16, fontweight='bold', labelpad=10)
+    ax.set_xlabel("Target Plate", fontsize=16, fontweight='bold', labelpad=10)
+    sns.despine(ax=ax)
+    ax.grid(axis='y', linestyle='--', alpha=0.2, color='grey')
+    ax.legend(title="Condition", frameon=True, facecolor='white',
+              bbox_to_anchor=(1.02, 1), loc='upper left',
+              fontsize=14, title_fontsize=15, prop={'weight':'bold'})
+    legend = ax.get_legend()
     if legend:
         plt.setp(legend.get_title(), fontweight='bold')
-        
-    plt.tight_layout()
+    fig.tight_layout()
     if save_path is not None:
-        _savefig(os.path.join(save_path, "EMD_per_plate_boxplot.png"), dpi=300)
+        _savefig(os.path.join(save_path, "EMD_per_plate_boxplot.png"), fig=fig, dpi=300, bbox_inches="tight")
     else:
         plt.show()
-    plt.close()
+    plt.close(fig)
 
     # PER-PLATE KDE PLOTS
-    unique_plates = pd.unique(pd.concat([emd_df["plate1"], emd_df["plate2"]]))
+    unique_plates = emd_df["plate2"].unique()
     for plate in unique_plates:
-        df_plate = pd.concat([
-            emd_df[emd_df["plate1"] == plate],
-            emd_df[emd_df["plate2"] == plate]
-        ])
+        df_plate = emd_df[emd_df["plate2"] == plate]
         if df_plate.empty: continue
 
         emd_raw_mean = df_plate["EMD_raw"].mean()
@@ -1094,7 +1260,8 @@ def plot_emd(emd_df, mad_score, save_path=None):
 
         plt.xlabel("Earth Mover's Distance (EMD)", fontsize=13, fontweight='bold')
         plt.ylabel("Density", fontsize=13, fontweight='bold')
-        plt.title(f"Batch Effect Reduction - Plate {plate}", fontsize=16, fontweight='bold')
+        reference_plate = df_plate["plate1"].iloc[0]
+        plt.title(f"Batch Effect Reduction - {plate} vs {reference_plate}", fontsize=16, fontweight='bold')
         plt.legend(loc="upper right", fontsize=11, prop={'weight':'bold'})
         plt.grid(alpha=0.3)
         plt.tight_layout()
@@ -1107,7 +1274,7 @@ def plot_emd(emd_df, mad_score, save_path=None):
 
 def plot_emd_per_marker(emd_df, save_path=None):
     """
-    Plots EMD grouped per marker for each plate using box plots and individual points.
+    Plots reference-based EMD per marker for each target plate.
     """
     if emd_df.empty:
         print("[WARN] No EMD data to plot.")
@@ -1120,10 +1287,8 @@ def plot_emd_per_marker(emd_df, save_path=None):
     raw_color = _BEFORE_COLOR
     corr_color = _AFTER_COLOR
 
-    # Combine plate1 and plate2 to get all plate involvements for EMD data
-    emd_p1 = emd_df[['plate1', 'marker', 'EMD_raw', 'EMD_corr']].rename(columns={'plate1': 'Plate'})
-    emd_p2 = emd_df[['plate2', 'marker', 'EMD_raw', 'EMD_corr']].rename(columns={'plate2': 'Plate'})
-    emd_combined = pd.concat([emd_p1, emd_p2])
+    # plate1 is always the reference; group results only by the target (plate2).
+    emd_combined = emd_df[['plate2', 'marker', 'EMD_raw', 'EMD_corr']].rename(columns={'plate2': 'Plate'})
 
     # Melt for seaborn: Plate, marker, Condition (Before/After), EMD
     emd_melted = emd_combined.melt(id_vars=['Plate', 'marker'], 
@@ -1200,7 +1365,12 @@ def plot_emd_per_marker(emd_df, save_path=None):
             except Exception as e:
                 print(f"[WARN] Wilcoxon failed for boxplot plate {plate}: {e}")
 
-        plt.title(f"EMD Distribution across Markers - Plate {plate}", fontsize=16, fontweight='bold')
+        reference_plate = emd_df["plate1"].iloc[0]
+        plt.title(
+            f"EMD Distribution across Markers - {plate} vs {reference_plate}",
+            fontsize=16,
+            fontweight='bold'
+        )
         plt.xlabel("Condition", fontsize=14, fontweight='bold')
         plt.ylabel("Earth Mover's Distance", fontsize=14, fontweight='bold')
         plt.xticks(fontsize=13, fontweight='bold')
@@ -1570,11 +1740,22 @@ def marker_corr(
     
     summary_records = []
 
-    # Per plate correlation preservation
-    plates = df_before[plate_col].unique()
-    for plate in plates:
-        df_b = df_before[df_before[plate_col]==plate][markers]
-        df_a = df_after[df_after[plate_col]==plate][markers]
+    # Per-plate correlation preservation by default. Passing plate_col=None
+    # requests one overall marker-correlation comparison across all cells.
+    if plate_col is None:
+        correlation_groups = [("All cells", df_before[markers], df_after[markers], "overall")]
+    else:
+        correlation_groups = [
+            (
+                str(plate),
+                df_before[df_before[plate_col] == plate][markers],
+                df_after[df_after[plate_col] == plate][markers],
+                "plate",
+            )
+            for plate in df_before[plate_col].unique()
+        ]
+
+    for plate, df_b, df_a, level in correlation_groups:
 
         corr_b = df_b.corr()
         corr_a = df_a.corr()
@@ -1584,7 +1765,14 @@ def marker_corr(
         corr_a_vals = corr_a.values[triu_idx]
 
         R, p_val = pearsonr(corr_b_vals, corr_a_vals)
-        summary_records.append({'level':'plate','plate':plate,'celltype':None,'group':None,'R':R,'p_value':p_val})
+        summary_records.append({
+            'level': level,
+            'plate': plate if level == 'plate' else None,
+            'celltype': None,
+            'group': None,
+            'R': R,
+            'p_value': p_val,
+        })
 
         # scatter plot
         plt.figure(figsize=(5,5))
@@ -1592,11 +1780,13 @@ def marker_corr(
         plt.plot([-1,1], [-1,1], 'r--', lw=1)
         plt.xlabel('Correlation Before', fontsize=12, fontweight='bold')
         plt.ylabel('Correlation After', fontsize=12, fontweight='bold')
-        plt.title(f'Plate {plate} correlation preservation\nR={R:.2f}')
+        title_prefix = f'Plate {plate}' if level == 'plate' else 'Overall marker'
+        plt.title(f'{title_prefix} correlation preservation\nR={R:.2f}')
         plt.legend(loc='lower right')
         plt.tight_layout()
         if save_dir:
-            _savefig(os.path.join(save_dir, f"scatter_plate_{plate}.png"), dpi=300)
+            save_name = f"scatter_plate_{plate}.png" if level == 'plate' else "scatter_overall.png"
+            _savefig(os.path.join(save_dir, save_name), dpi=300)
         else:
             plt.show()
         plt.close()
@@ -1716,6 +1906,8 @@ def visualize_shared_marker_correction(
     plate_col="plate",
     celltype_col="celltypes",
     panel_col="panel",
+    anchor_name=None,
+    sample_col="sample_name",
     subsample=50000,
     random_state=42,
     save_dir=None
@@ -1752,13 +1944,24 @@ def visualize_shared_marker_correction(
 
     print("Markers for visualization:", markers)
 
+    # Tag rows before concatenating panels so the same anchor cells can be selected
+    # in Before and After data.
+    def _tag_panel_rows(df, panel_name):
+        tagged = df.copy().reset_index(drop=True)
+        tagged[panel_col] = panel_name
+        tagged.index = pd.Index(
+            [f"{panel_name}:{i}" for i in range(len(tagged))],
+            name="__paired_cell_id",
+        )
+        return tagged
+
     # Combine raw and corrected data
-    dfs_before = [df_raw_P1.assign(panel="Panel1").reset_index(drop=True)]
-    dfs_after = [df_corrected_P1.assign(panel="Panel1").reset_index(drop=True)]
+    dfs_before = [_tag_panel_rows(df_raw_P1, "Panel1")]
+    dfs_after = [_tag_panel_rows(df_corrected_P1, "Panel1")]
     
     if has_p2:
-        dfs_before.append(df_raw_P2.assign(panel="Panel2").reset_index(drop=True))
-        dfs_after.append(df_corrected_P2.assign(panel="Panel2").reset_index(drop=True))
+        dfs_before.append(_tag_panel_rows(df_raw_P2, "Panel2"))
+        dfs_after.append(_tag_panel_rows(df_corrected_P2, "Panel2"))
 
     # Downsample BEFORE concatenation to save memory
     # Total cells across all panels
@@ -1817,6 +2020,40 @@ def visualize_shared_marker_correction(
     plate_palette = _build_plate_palette(all_plates)
     adata.uns[f"{plate_col}_colors"] = [plate_palette[p] for p in all_plates]
 
+    # For the plate-colored diagnostic, use only the shared anchor sample and
+    # balance cells across panel/plate groups. The all-sample embedding above is
+    # retained for cell-type and panel-colored biological-preservation plots.
+    adata_plate = adata
+    if anchor_name is not None:
+        anchor_before_full = pd.concat(dfs_before, axis=0)
+        anchor_after_full = pd.concat(dfs_after, axis=0)
+        anchor_before, anchor_after = _balanced_paired_anchor_subset(
+            anchor_before_full,
+            anchor_after_full,
+            anchor_name=anchor_name,
+            sample_col=sample_col,
+            group_cols=(panel_col, plate_col),
+            max_cells=subsample,
+            random_state=random_state,
+        )
+        anchor_before["status"] = "Before"
+        anchor_after["status"] = "After"
+        anchor_all = pd.concat([anchor_before, anchor_after], ignore_index=True)
+        anchor_obs_cols = [plate_col, panel_col, "status"]
+        adata_plate = ad.AnnData(
+            anchor_all[markers].fillna(0).to_numpy(dtype=np.float32),
+            obs=anchor_all[anchor_obs_cols].copy(),
+        )
+        sc.pp.scale(adata_plate, max_value=10)
+        sc.tl.pca(adata_plate, svd_solver="arpack")
+        sc.pp.neighbors(adata_plate)
+        sc.tl.umap(adata_plate, random_state=random_state)
+        anchor_plates = sorted(str(p) for p in adata_plate.obs[plate_col].unique())
+        anchor_plate_palette = _build_plate_palette(anchor_plates)
+        adata_plate.uns[f"{plate_col}_colors"] = [
+            anchor_plate_palette[p] for p in anchor_plates
+        ]
+
     # Layout per panel, colored by Plate
     panels_to_plot = ["Panel1"]
     if has_p2: panels_to_plot.append("Panel2")
@@ -1825,8 +2062,8 @@ def visualize_shared_marker_correction(
     for i, status in enumerate(["Before", "After"]):
         for j, panel in enumerate(panels_to_plot):
             ax = axes[i, j]
-            mask = (adata.obs["status"] == status) & (adata.obs["panel"] == panel)
-            sub = adata[mask]
+            mask = (adata_plate.obs["status"] == status) & (adata_plate.obs[panel_col] == panel)
+            sub = adata_plate[mask]
             if sub.n_obs == 0:
                 continue
             sc.pl.umap(sub, color=plate_col, ax=ax, show=False, size=6, frameon=False)
@@ -1840,7 +2077,12 @@ def visualize_shared_marker_correction(
             ax.yaxis.label.set_weight('bold')
 
     plt.tight_layout()
-    plt.suptitle("UMAP of Marker Correction - Plate Coloring", fontsize=18, fontweight='bold', y=1.02)
+    plt.suptitle(
+        "UMAP of Marker Correction - Plate Coloring",
+        fontsize=18,
+        fontweight='bold',
+        y=1.02,
+    )
     if save_dir:
         _savefig(os.path.join(save_dir, "umap_shared_by_plate.png"), dpi=300, bbox_inches='tight')
     plt.close()
@@ -2472,39 +2714,44 @@ def marker_expression_correlation_plot(df_P1_before, df_P1_after,
     has_p2 = (df_P2_before is not None and df_P2_after is not None)
     if has_p2:
         markers_P2 = [c for c in df_P2_before.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_P2_before[c]) and c and str(c).strip()]
-        # Restrict to shared markers across both panels
-        shared_markers = sorted(set(markers_P1) & set(markers_P2))
-        if shared_markers:
-            p1_before_shared = df_P1_before[shared_markers].median()
-            p1_after_shared = df_P1_after[shared_markers].median()
-            df_P1 = pd.DataFrame({
-                "marker": shared_markers,
-                "before": p1_before_shared.values,
-                "after": p1_after_shared.values,
-                "panel": "Panel1"
-            })
-            dfs_to_concat = [df_P1]
-            p2_before = df_P2_before[shared_markers].median()
-            p2_after = df_P2_after[shared_markers].median()
-            df_P2 = pd.DataFrame({
-                "marker": shared_markers,
-                "before": p2_before.values,
-                "after": p2_after.values,
-                "panel": "Panel2"
-            })
-        else:
-            p2_before = df_P2_before[markers_P2].median()
-            p2_after = df_P2_after[markers_P2].median()
-            df_P2 = pd.DataFrame({
-                "marker": markers_P2,
-                "before": p2_before.values,
-                "after": p2_after.values,
-                "panel": "Panel2"
-            })
+        # Preserve every marker that is measured in Panel2. Merged matrices may
+        # also contain all-NaN columns belonging only to Panel1; the finite-value
+        # filter below removes those per panel. Do not restrict both panels to
+        # their marker intersection, because panel-specific markers are valid
+        # observations for expression-preservation analysis.
+        p2_before = df_P2_before[markers_P2].median()
+        p2_after = df_P2_after[markers_P2].median()
+        df_P2 = pd.DataFrame({
+            "marker": markers_P2,
+            "before": p2_before.values,
+            "after": p2_after.values,
+            "panel": "Panel2"
+        })
         dfs_to_concat.append(df_P2)
 
     # Combine
     df = pd.concat(dfs_to_concat, ignore_index=True)
+
+    # A merged matrix can retain marker columns from another panel as all-NaN
+    # columns. Their medians are non-finite and scipy.stats.pearsonr rejects
+    # them, so keep only markers with usable before/after summary values.
+    finite_mask = np.isfinite(df["before"]) & np.isfinite(df["after"])
+    excluded = df.loc[~finite_mask, ["panel", "marker", "before", "after"]]
+    if not excluded.empty:
+        excluded_labels = ", ".join(
+            f"{row.panel}:{row.marker}" for row in excluded.itertuples(index=False)
+        )
+        print(
+            "[WARN] Excluding markers with non-finite before/after medians: "
+            f"{excluded_labels}"
+        )
+    df = df.loc[finite_mask].copy()
+
+    if len(df) < 2:
+        raise ValueError(
+            "Marker-expression correlation requires at least two markers with "
+            "finite before/after medians."
+        )
     
     # Save marker expression correlation to CSV
     if save_dir:
@@ -2592,7 +2839,13 @@ def load_and_preprocess_panel_batch(panel_name, dataset_to_process, ctx, verbose
     
     # Scan Time-Corrected directory to find valid plates (those containing the anchor)
     time_dir = os.path.join(ctx.output_dir, "time_corrected")
-    time_index = get_indexed_files(time_dir, dataset_to_process, panel_name, metadata_df)
+    time_index = get_indexed_files(
+        time_dir,
+        dataset_to_process,
+        panel_name,
+        metadata_df,
+        recursive=True,
+    )
 
     # Filter to only keep plates that contain the anchor sample
     valid_plates_index = {}
@@ -2678,7 +2931,19 @@ def load_and_preprocess_panel_batch(panel_name, dataset_to_process, ctx, verbose
     df_b = arcsinh(df_b, markers) # Apply arcsinh to Time-Corrected data
 
     # Scan Batch-Corrected directory (Results root) for the corresponding plates
-    corr_index = get_indexed_files(ctx.output_dir, dataset_to_process, panel_name, metadata_df, exclude_uncorrected=True)
+    corrected_dir = os.path.join(ctx.output_dir, "corrected")
+    recursive_outputs = os.path.isdir(corrected_dir)
+    if not recursive_outputs:
+        # Backward compatibility with legacy flat output directories.
+        corrected_dir = ctx.output_dir
+    corr_index = get_indexed_files(
+        corrected_dir,
+        dataset_to_process,
+        panel_name,
+        metadata_df,
+        exclude_uncorrected=True,
+        recursive=recursive_outputs,
+    )
     all_after_files = []
     for plate in sorted(valid_plates_index.keys()):
         if plate in corr_index:

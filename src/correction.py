@@ -33,10 +33,20 @@ def time_correction(df, panel, ctx, window=500, slope_clip=(0.3, 3)):
 
     sample_group_col = "original_filename" if "original_filename" in df.columns else "sample_name"
     df_panel = df[df['panel'] == panel].dropna(axis=1, how="all").copy()
-    df_corrected = df_panel.copy()
+    df_corrected = df_panel
+
+    if "Time" not in df_panel.columns:
+        print(f"[WARN-TIME] Panel {panel!r} has no 'Time' column — skipping time correction.")
+        return df_panel
 
     stable_markers = stable_marker if isinstance(stable_marker, list) else [stable_marker]
     stable_markers = [c for c in df_panel.columns if c in stable_markers]
+    if not stable_markers:
+        print(
+            f"[WARN-TIME] None of the configured stable marker(s) "
+            f"{stable_marker!r} exist in panel {panel!r} — skipping time correction."
+        )
+        return df_panel
 
     # Build the exclusion set: metadata + stable channels + gate/flag columns.
     # Gate columns (OmiqFilter-derived binary flags, ctx.celltypes, ctx.celltype_gating)
@@ -96,7 +106,7 @@ def time_correction(df, panel, ctx, window=500, slope_clip=(0.3, 3)):
                 print(f"[TIME]     CellType={celltype} | n={len(df_cell)} | window={cell_specific_window}")
 
                 # 1. Sort by acquisition time
-                df_cell_sorted = df_cell.sort_values('Time').astype("float", errors='ignore')
+                df_cell_sorted = df_cell.sort_values('Time')
 
                 # 2. Rolling median of the stable channel
                 df_cell_sorted[stable_markers] = df_cell_sorted[stable_markers].apply(
@@ -118,12 +128,12 @@ def time_correction(df, panel, ctx, window=500, slope_clip=(0.3, 3)):
                     slopes_df[m] = s
 
                 # Average slope across stable markers (handles multi-channel references)
-                slope_mean = slopes_df.mean(axis=1).astype(float).values
+                slope_mean = slopes_df.mean(axis=1).to_numpy(dtype=np.float32)
 
                 # 4. Apply slope to biological markers and stable channel
                 for m in markers_to_correct + stable_markers:
-                    col_values = pd.to_numeric(df_cell_sorted[m], errors='coerce').values
-                    df_corrected.loc[df_cell_sorted.index, m] = col_values * slope_mean
+                    col_values = pd.to_numeric(df_cell_sorted[m], errors='coerce').to_numpy(dtype=np.float32)
+                    df_corrected.loc[df_cell_sorted.index, m] = (col_values * slope_mean).astype(np.float32, copy=False)
 
                 n_corrected_cells += len(df_cell)
 
@@ -134,14 +144,17 @@ def time_correction(df, panel, ctx, window=500, slope_clip=(0.3, 3)):
 
     return df_corrected
 
-def arcsinh(df, markers, cofactor=5):
+def arcsinh(df, markers, cofactor=5, copy=True, dtype=np.float32):
     """
     Apply arcsinh transformation to marker signals, commonly used for normalization in flow/mass cytometry data.
     """
-    df = df.copy()
+    if copy:
+        df = df.copy()
     # Filter only existing markers and ensure they are numeric
     valid_markers = [m for m in markers if m in df.columns and pd.api.types.is_numeric_dtype(df[m])]
-    df[valid_markers] = np.arcsinh(df[valid_markers].astype(float) / cofactor)
+    for m in valid_markers:
+        values = pd.to_numeric(df[m], errors='coerce').to_numpy(dtype=dtype)
+        df[m] = np.arcsinh(values / cofactor).astype(dtype, copy=False)
     return df
 
 def build_reference_stats(df, markers, anchor_sample, dataset, panel, ctx):
@@ -236,7 +249,7 @@ def batch_correct_plate(df_plate, markers, ref_stats, anchor_sample):
         if len(anchor_values) == 0 or (anchor_values == 0).all():
             print(f"[BATCH] {m} | No valid signal in anchor sample for this plate. Keeping Arcsinh values.")
             # Convert to numeric to ensure consistency, but don't transform
-            df[m] = pd.to_numeric(df[m], errors='coerce')
+            df[m] = pd.to_numeric(df[m], errors='coerce').astype(np.float32)
             continue
 
         qlo = ref_stats[m]["qlo"]
@@ -258,7 +271,7 @@ def batch_correct_plate(df_plate, markers, ref_stats, anchor_sample):
             
         print(f"[BATCH] {m} | batLo={batLo:.3f} batHi={batHi:.3f} scale={scale:.3f} shift={shift:.3f}")
         # Apply linear transformation to all cells. Ensure numeric and preserve data.
-        target_values = pd.to_numeric(df[m], errors='coerce')
-        df[m] = np.maximum(target_values * scale + shift, 0)
+        target_values = pd.to_numeric(df[m], errors='coerce').to_numpy(dtype=np.float32)
+        df[m] = np.maximum(target_values * scale + shift, 0).astype(np.float32, copy=False)
     return df
 

@@ -140,8 +140,8 @@ Direct validation of the anchor-based alignment.
 #### **Folder: Batch_UMAP/**
 UMAP visual proof of batch removal.
 *   **`umap_plate_effect_{panel}.png`**: (from `umap_plate_effect`)
-    *   **What it shows**: Two UMAPs (Before vs After) colored by **Plate**.
-    *   **Significance**: "Before," cells often cluster by plate (technical bias). "After," cells from different plates should intermix, forming clusters based on biology (cell type) rather than plate.
+    *   **What it shows**: Two UMAPs (Before vs After) using only the shared anchor sample from plates where it is available, balanced to the same number of cells per plate and colored by **Plate**.
+    *   **Significance**: Because the biological source is held constant, improved plate-color mixing after correction directly reflects reduced technical plate effects.
 *   **`umap_batch_evaluation_{panel}.png`**: (from `umap_batch_evaluation`)
     *   **What it shows**: A grid showing Raw vs Corrected, colored by Plate and Cell Type.
     *   **Significance**: Confirms that while plate effects are removed (intermixing in Plate plot), biological structures are preserved (distinct clusters in Cell Type plot).
@@ -195,7 +195,7 @@ These visualizations are located at the `results/{dataset}/` and appear only whe
 
 #### **Folder: SharedMarker_Comparison/**
 Evaluates how well markers that are common to both panels have been normalized.
-*   **`umap_shared_by_plate.png`**: Shows shared markers colored by Plate. "Before," cells often cluster by plate (technical bias). "After," cells from different plates should intermix, forming clusters based on biology (cell type) rather than plate.
+*   **`umap_shared_by_plate.png`**: Uses only the shared anchor sample from plates where it is available, balances cell counts per panel/plate, and colors cells by Plate. Improved color mixing after correction directly reflects reduced technical plate effects.
 *   **`umap_shared_by_celltype.png`**: Multi-panel UMAP colored by Cell Type. Essential to verify that the same cell type from different panels clusters together.
 *   **`umap_shared_by_panel.png`**: Specifically colored by Panel. Ideally, the "Panel 1" and "Panel 2" populations should overlap significantly for the shared markers.
 

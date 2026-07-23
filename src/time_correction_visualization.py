@@ -1066,7 +1066,13 @@ def load_and_preprocess_panel_time(panel_name, dataset_to_process, ctx, verbose=
     out_dir = ctx.output_dir
     time_dir = os.path.join(out_dir, "time_corrected")
     
-    corrected_files_dict = get_indexed_files(time_dir, dataset_to_process, panel_name, metadata_df)
+    corrected_files_dict = get_indexed_files(
+        time_dir,
+        dataset_to_process,
+        panel_name,
+        metadata_df,
+        recursive=True,
+    )
     corrected_files = []
     for paths in corrected_files_dict.values():
         corrected_files.extend(paths)

@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
+from patsy import dmatrix
 from FlowCytometryTools import FCMeasurement
 from glob import glob
 from collections import defaultdict
@@ -42,9 +43,17 @@ def _savefig(save_path, fig=None, **kwargs):
     _fig.savefig(svg_path, **svg_kw)
 
 
-def get_indexed_files(directory, dataset_filter, panel_filter, metadata_df, exclude_uncorrected=False):
+def get_indexed_files(
+    directory,
+    dataset_filter,
+    panel_filter,
+    metadata_df,
+    exclude_uncorrected=False,
+    recursive=False,
+):
     """
     Scans a directory for CyTOF files and indexes them by plate based on metadata.
+    Set ``recursive=True`` for dataset/panel/plate-partitioned output trees.
     """
     if metadata_df is None:
         return {}
@@ -57,7 +66,8 @@ def get_indexed_files(directory, dataset_filter, panel_filter, metadata_df, excl
     metadata_df_copy = metadata_df.copy()
     metadata_df_copy["_clean_name"] = metadata_df_copy["file_name"].apply(clean)
 
-    for f in glob(os.path.join(directory, "*")):
+    pattern = os.path.join(directory, "**", "*") if recursive else os.path.join(directory, "*")
+    for f in glob(pattern, recursive=recursive):
         if not f.lower().endswith(('.csv', '.fcs')):
             continue
         
@@ -140,6 +150,99 @@ def load_config(path):
     """
     with open(path, "r") as f:
         return json.load(f)
+
+
+def infer_panel_config_paths(study_config_path, panel_names, current_panel=None):
+    """
+    Resolve one study config per panel.
+
+    The common naming pattern is "..._Panel1.json" / "..._Panel2.json".
+    When a split config is not found, the original config is reused because one
+    study config may point to a merged matrix containing both panels. Downstream
+    panel filtering determines whether that panel actually has rows.
+    """
+    study_config_path = os.path.abspath(study_config_path)
+    current_panel = str(current_panel or "")
+    panel_paths = {}
+
+    for panel_name in panel_names:
+        panel_name = str(panel_name)
+        if panel_name == current_panel:
+            panel_paths[panel_name] = study_config_path
+            continue
+
+        candidates = []
+        if current_panel:
+            candidates.append(study_config_path.replace(f"_{current_panel}.json", f"_{panel_name}.json"))
+            candidates.append(study_config_path.replace(current_panel, panel_name))
+
+        panel_paths[panel_name] = next(
+            (p for p in candidates if os.path.exists(p)),
+            study_config_path,
+        )
+
+    return panel_paths
+
+
+def read_matrix_filtered(
+    path,
+    dataset=None,
+    panel=None,
+    chunksize=250_000,
+    sample_per_sample=None,
+    random_state=42,
+    low_memory=False,
+):
+    """
+    Read a matrix CSV with optional dataset/panel filtering.
+
+    Uses chunked reads by default so large merged matrices do not have to be
+    materialized before filtering. Set sample_per_sample to keep at most N cells
+    per sample_name while streaming.
+    """
+    if chunksize is None or chunksize <= 0:
+        df = pd.read_csv(path, low_memory=low_memory)
+        if dataset is not None and "dataset" in df.columns:
+            df = df[df["dataset"].astype(str) == str(dataset)].copy()
+        if panel is not None and "panel" in df.columns:
+            df = df[df["panel"].astype(str) == str(panel)].copy()
+        return df
+
+    kept = []
+    counts = defaultdict(int)
+    rng_seed = int(random_state)
+
+    for chunk_idx, chunk in enumerate(pd.read_csv(path, chunksize=chunksize, low_memory=low_memory)):
+        if dataset is not None and "dataset" in chunk.columns:
+            chunk = chunk[chunk["dataset"].astype(str) == str(dataset)]
+        if panel is not None and "panel" in chunk.columns:
+            chunk = chunk[chunk["panel"].astype(str) == str(panel)]
+        if chunk.empty:
+            continue
+
+        if sample_per_sample is None or sample_per_sample <= 0:
+            kept.append(chunk.copy())
+            continue
+
+        if "sample_name" not in chunk.columns:
+            take = min(len(chunk), sample_per_sample)
+            kept.append(chunk.sample(n=take, random_state=rng_seed + chunk_idx))
+            continue
+
+        sampled_groups = []
+        for sample_name, group in chunk.groupby("sample_name", observed=True):
+            remaining = sample_per_sample - counts[str(sample_name)]
+            if remaining <= 0:
+                continue
+            take = min(len(group), remaining)
+            sampled_groups.append(group.sample(n=take, random_state=rng_seed + chunk_idx))
+            counts[str(sample_name)] += take
+        if sampled_groups:
+            kept.append(pd.concat(sampled_groups, ignore_index=True))
+
+    if not kept:
+        return pd.DataFrame()
+    return pd.concat(kept, ignore_index=True)
 
 
 
@@ -412,11 +515,14 @@ def enforce_schema(df, ctx):
             valid_data_cols.append(c)
     
     # 5. Separate into target markers (for correction) and extra markers (just arcsinh)
-    markers = [m for m in ctx.true_markers if m in valid_data_cols]
+    markers = [m for m in dict.fromkeys(ctx.true_markers) if m in valid_data_cols]
     extra_markers = [c for c in valid_data_cols if c not in ctx.true_markers]
     
-    # Reorder: Meta + Correction Markers + Extra Markers
-    full_df = df[meta + ["celltypes"] + markers + extra_markers].copy()
+    # Reorder: metadata + optional canonical cell type + signal columns.
+    # `celltypes` is optional so databases without labels/gating can still run
+    # batch correction; time correction will explicitly skip in that case.
+    celltype_cols = ["celltypes"] if "celltypes" in df.columns else []
+    full_df = df[meta + celltype_cols + markers + extra_markers].copy()
     
     # Return ONLY 2 values as expected by the rest of the pipeline
     return full_df, markers
@@ -737,6 +843,298 @@ def variation_marker(df, markers, group_col, info_cols, panel=None, subsample=10
                 print(f"  [WARN] ANOVA failed for {group} marker {marker}: {e}")
 
     return pd.DataFrame(all_res)
+
+
+def variation_marker_time_spline(
+    df,
+    markers,
+    panel=None,
+    group_cols=("plate", "original_filename", "celltypes"),
+    time_col="Time",
+    spline_df=4,
+    min_cells=200,
+    n_time_bins=20,
+    max_cells_per_bin=250,
+    random_state=42,
+):
+    """Estimate within-run nonlinear time variance for every marker.
+
+    Acquisition time is normalized to [0, 1] independently inside each available
+    plate/file/cell-type group. Cells are sampled evenly across time bins, so large
+    runs cannot dominate and the beginning/end of a run remain represented. The
+    reported value is the partial R-squared of a cubic B-spline relative to an
+    intercept-only model.
+
+    Calling this function on before/after matrices with identical metadata and the
+    same ``random_state`` selects the same acquisition groups and time strata.
+    """
+    if panel is not None and "panel" in df.columns:
+        work = df[df["panel"].astype(str) == str(panel)].copy()
+    else:
+        work = df.copy()
+
+    if time_col not in work.columns:
+        raise KeyError(f"Missing acquisition-time column: {time_col!r}")
+
+    markers = [
+        m for m in markers
+        if m in work.columns and pd.api.types.is_numeric_dtype(work[m])
+    ]
+    if not markers:
+        return pd.DataFrame(columns=[
+            "group", "marker", "factor", "time_model", "variance_explained",
+            "sum_sq_per_cell", "n_cells", "relative_time_min",
+            "relative_time_max",
+        ])
+
+    requested_groups = list(group_cols)
+    if "original_filename" not in work.columns and "sample_name" in work.columns:
+        requested_groups = [
+            "sample_name" if c == "original_filename" else c
+            for c in requested_groups
+        ]
+    active_groups = list(dict.fromkeys(c for c in requested_groups if c in work.columns))
+    if not active_groups:
+        active_groups = ["panel"] if "panel" in work.columns else []
+
+    work[time_col] = pd.to_numeric(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col])
+    grouped = work.groupby(active_groups, observed=True, sort=False) if active_groups else [("all", work)]
+    results = []
+    skipped_small = skipped_time = 0
+
+    for group_key, group in grouped:
+        if len(group) < min_cells:
+            skipped_small += 1
+            continue
+
+        time_min = group[time_col].min()
+        time_max = group[time_col].max()
+        time_range = time_max - time_min
+        if not np.isfinite(time_range) or time_range <= 0:
+            skipped_time += 1
+            continue
+
+        group = group.copy()
+        group["relative_time"] = (group[time_col] - time_min) / time_range
+
+        if n_time_bins and max_cells_per_bin:
+            bin_ids = pd.cut(
+                group["relative_time"],
+                bins=np.linspace(0.0, 1.0, int(n_time_bins) + 1),
+                labels=False,
+                include_lowest=True,
+            )
+            sampled = []
+            for bin_id, bin_group in group.groupby(bin_ids, observed=True, sort=False):
+                take = min(len(bin_group), int(max_cells_per_bin))
+                # Stable per-bin seeds make separate before/after calls reproducible.
+                seed = int(random_state) + int(bin_id if pd.notna(bin_id) else 0)
+                sampled.append(bin_group.sample(n=take, random_state=seed))
+            group = pd.concat(sampled, axis=0).sort_index() if sampled else group.iloc[0:0]
+
+        if len(group) < min_cells or group["relative_time"].nunique() <= spline_df:
+            skipped_small += 1
+            continue
+
+        try:
+            design = np.asarray(dmatrix(
+                f"bs(relative_time, df={int(spline_df)}, degree=3, "
+                "include_intercept=False)",
+                data=group,
+                return_type="dataframe",
+            ), dtype=float)
+            values = group[markers].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+            valid_rows = np.isfinite(design).all(axis=1) & np.isfinite(values).all(axis=1)
+            design = design[valid_rows]
+            values = values[valid_rows]
+            if len(values) < min_cells:
+                skipped_small += 1
+                continue
+
+            fitted = design @ np.linalg.lstsq(design, values, rcond=None)[0]
+            residual_ss = np.square(values - fitted).sum(axis=0)
+            centered = values - values.mean(axis=0, keepdims=True)
+            total_ss = np.square(centered).sum(axis=0)
+            explained_ss = np.maximum(total_ss - residual_ss, 0.0)
+            partial_r2 = np.divide(
+                explained_ss,
+                total_ss,
+                out=np.zeros_like(explained_ss),
+                where=total_ss > 0,
+            )
+
+            if not isinstance(group_key, tuple):
+                group_key = (group_key,)
+            group_label = " | ".join(
+                f"{col}={value}" for col, value in zip(active_groups, group_key)
+            ) or "all"
+            for marker, r2, ss in zip(markers, partial_r2, explained_ss):
+                results.append({
+                    "group": group_label,
+                    "marker": marker,
+                    # Keep the historical factor label so existing variance plots
+                    # continue to recognize this as the time component.
+                    "factor": "Time",
+                    "time_model": f"cubic_bspline_df{int(spline_df)}",
+                    "variance_explained": float(r2),
+                    "sum_sq_per_cell": float(ss / len(values)),
+                    "n_cells": int(len(values)),
+                    "relative_time_min": 0.0,
+                    "relative_time_max": 1.0,
+                })
+        except Exception as exc:
+            print(f"  [WARN] Time-spline variance failed for {group_key}: {exc}")
+
+    print(
+        f"  [INFO] Time-spline variance: groups={len(set(r['group'] for r in results)) if results else 0}, "
+        f"rows={len(results)}, skipped_small={skipped_small}, skipped_no_time_range={skipped_time}"
+    )
+    return pd.DataFrame(results)
+
+
+def variation_marker_time_linear_nested(
+    df,
+    markers,
+    panel=None,
+    time_col="Time",
+    acquisition_cols=("plate", "original_filename"),
+    control_cols=("plate", "sample_name", "celltypes"),
+    time_slope_col="sample_name",
+    min_cells=200,
+    n_time_bins=20,
+    max_cells_per_stratum=250,
+    random_state=42,
+):
+    """Time partial R-squared from nested linear fixed-effect models.
+
+    Reduced: expression ~ C(plate) + C(sample) + C(celltype)
+    Full:    expression ~ relative_time:C(sample)
+                          + C(plate) + C(sample) + C(celltype)
+
+    ``relative_time`` is calculated independently within each acquisition file.
+    Sampling is balanced over acquisition, cell type, and relative-time bin before
+    fitting. The same metadata and random seed therefore give reproducible
+    before/after samples.
+    """
+    if panel is not None and "panel" in df.columns:
+        work = df[df["panel"].astype(str) == str(panel)].copy()
+    else:
+        work = df.copy()
+    if time_col not in work.columns:
+        raise KeyError(f"Missing acquisition-time column: {time_col!r}")
+
+    markers = [
+        m for m in markers
+        if m in work.columns and pd.api.types.is_numeric_dtype(work[m])
+    ]
+    output_cols = [
+        "group", "marker", "factor", "time_model", "variance_explained",
+        "sum_sq_per_cell", "n_cells",
+    ]
+    if not markers:
+        return pd.DataFrame(columns=output_cols)
+
+    acquisition_cols = [c for c in acquisition_cols if c in work.columns]
+    if "original_filename" not in acquisition_cols and "sample_name" in work.columns:
+        acquisition_cols = list(dict.fromkeys(acquisition_cols + ["sample_name"]))
+    if not acquisition_cols:
+        raise KeyError("Need original_filename or sample_name to calculate relative_time")
+
+    active_controls = [c for c in control_cols if c in work.columns]
+    if time_slope_col not in work.columns:
+        raise KeyError(f"Missing sample-specific time-slope column: {time_slope_col!r}")
+    work[time_col] = pd.to_numeric(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col] + active_controls)
+    time_group = work.groupby(acquisition_cols, observed=True)[time_col]
+    time_min = time_group.transform("min")
+    time_range = time_group.transform("max") - time_min
+    work["relative_time"] = (work[time_col] - time_min) / time_range.replace(0, np.nan)
+    work = work.dropna(subset=["relative_time"])
+    work = work[work["relative_time"].between(0.0, 1.0)]
+
+    if n_time_bins and max_cells_per_stratum:
+        work["_time_bin"] = pd.cut(
+            work["relative_time"],
+            bins=np.linspace(0.0, 1.0, int(n_time_bins) + 1),
+            labels=False,
+            include_lowest=True,
+        )
+        strata = list(dict.fromkeys(
+            acquisition_cols
+            + (["celltypes"] if "celltypes" in work.columns else [])
+            + ["_time_bin"]
+        ))
+        sampled = []
+        for stratum_index, (_, stratum) in enumerate(
+            work.groupby(strata, observed=True, sort=False)
+        ):
+            take = min(len(stratum), int(max_cells_per_stratum))
+            sampled.append(stratum.sample(
+                n=take,
+                random_state=int(random_state) + stratum_index,
+            ))
+        work = pd.concat(sampled, ignore_index=True) if sampled else work.iloc[0:0]
+
+    values = work[markers].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(values).all(axis=1) & np.isfinite(work["relative_time"].to_numpy())
+    work = work.loc[valid].reset_index(drop=True)
+    values = values[valid]
+    if len(work) < min_cells:
+        print(f"  [WARN] Linear time variance skipped: only {len(work)} valid cells")
+        return pd.DataFrame(columns=output_cols)
+
+    # Dummy coding is equivalent to C(...) in the requested statsmodels formula.
+    controls = pd.get_dummies(
+        work[active_controls].astype("string"),
+        columns=active_controls,
+        drop_first=True,
+        dtype=float,
+    )
+    reduced_x = np.column_stack([
+        np.ones(len(work), dtype=float),
+        controls.to_numpy(dtype=float),
+    ])
+    # One relative-time column per sample is equivalent to
+    # relative_time:C(sample) in a formula model. Keep all sample levels here:
+    # unlike the categorical main effects, these are slopes rather than intercepts.
+    sample_slope_dummies = pd.get_dummies(
+        work[time_slope_col].astype("string"),
+        drop_first=False,
+        dtype=float,
+    ).to_numpy(dtype=float)
+    time_by_sample = (
+        sample_slope_dummies
+        * work["relative_time"].to_numpy(dtype=float)[:, None]
+    )
+    full_x = np.column_stack([reduced_x, time_by_sample])
+
+    reduced_fit = reduced_x @ np.linalg.lstsq(reduced_x, values, rcond=None)[0]
+    full_fit = full_x @ np.linalg.lstsq(full_x, values, rcond=None)[0]
+    reduced_sse = np.square(values - reduced_fit).sum(axis=0)
+    full_sse = np.square(values - full_fit).sum(axis=0)
+    time_ss = np.maximum(reduced_sse - full_sse, 0.0)
+    partial_r2 = np.divide(
+        time_ss,
+        reduced_sse,
+        out=np.zeros_like(time_ss),
+        where=reduced_sse > 0,
+    )
+
+    result = pd.DataFrame({
+        "group": "all",
+        "marker": markers,
+        "factor": "Time",
+        "time_model": f"linear_relative_time_by_{time_slope_col}_nested",
+        "variance_explained": partial_r2,
+        "sum_sq_per_cell": time_ss / len(work),
+        "n_cells": len(work),
+    })
+    print(
+        f"  [INFO] Linear nested time variance: cells={len(work)}, markers={len(markers)}, "
+        f"controls={active_controls}, sample_specific_slopes={time_slope_col}"
+    )
+    return result
 
 
 # Bar plot comparing variance explained by each factor before and after correction, for both panels side by side

@@ -1,0 +1,42 @@
+{
+  "data_dir": "./data",
+  "output_dir": "./output",
+  "ref_plate": "Plate1",
+  "anchors": {
+    "D0": "ANCHOR_D0",
+    "D24": "ANCHOR_D24"
+  },
+  "meta_cols": [
+    "Event_length",
+    "Time",
+    "dataset",
+    "panel",
+    "plate",
+    "sample_name",
+    "cell_type",
+    "condition"
+  ],
+  "celltypes": [
+    "T-cells",
+    "B-cells",
+    "myeloid"
+  ],
+  "celltype_gating": [
+    "T-cells",
+    "B-cells",
+    "myeloid"
+  ],
+  "celltype2correct": [
+    "T-cells",
+    "B-cells",
+    "myeloid"
+  ],
+  "stable_marker": "DNA",
+  "true_markers": [
+    "CD45",
+    "DNA",
+    "CD3",
+    "CD19"
+  ],
+  "metal_to_marker": {}
+}

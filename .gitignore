@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# Local configuration and credentials
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# Real study configuration and participant metadata are machine-local.
+# Commit only the corresponding *.example.* templates.
+/metadata/meta.json
+/metadata/metadata.xlsx
+
+# ---------------------------------------------------------------------------
+# Study data and generated analysis artefacts
+# ---------------------------------------------------------------------------
+/data/
+/output/
+/outputs/
+/results/
+/figures/
+/logs/
+
+*.fcs
+*.h5
+*.h5ad
+*.loom
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.joblib
+
+# Local method experiments and paper analyses
+/local_*/
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.python-version
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# ---------------------------------------------------------------------------
+# Jupyter / IPython
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+/.jupyter_config/
+/.jupyter_data/
+.ipython/
+
+# ---------------------------------------------------------------------------
+# Editors and operating systems
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+~$*

@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import matplotlib
 # Force non-interactive backend only when running as a plain script, not in Jupyter
 if 'ipykernel' not in sys.modules:
@@ -62,7 +63,37 @@ warnings.filterwarnings("ignore", message=".*dtype argument will be deprecated.*
 warnings.filterwarnings("ignore", message="No data for colormapping provided via 'c'")
 warnings.filterwarnings("ignore", message="Tight layout not applied")
 
-def load_data_from_omiq(data_dir, metadata_df, ctx, dataset=None, panel=None, celltype_col=None):
+
+def _safe_path_component(value):
+    """Return a filesystem-safe directory component for metadata identifiers."""
+    component = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value)).strip(" .")
+    return component or "unknown"
+
+
+def _prepare_correction_file(df, ctx):
+    """Apply the same schema preparation to every reference and target file."""
+    df = df.copy()
+    df.columns = [
+        harmonize_marker(c)
+        if not str(c).startswith("OmiqFilter")
+        else str(c).replace("OmiqFilter", "")
+        for c in df.columns
+    ]
+    df = apply_marker_schema(df, ctx)
+    if "celltypes" not in df.columns:
+        df = assign_cell_type(df, ctx)
+    return enforce_schema(df, ctx)
+
+
+def load_data_from_omiq(
+    data_dir,
+    metadata_df,
+    ctx,
+    dataset=None,
+    panel=None,
+    celltype_col=None,
+    numeric_dtype="float32",
+):
     """
     Load CyTOF files exported from OMIQ and return an annotated cell matrix.
 
@@ -86,6 +117,8 @@ def load_data_from_omiq(data_dir, metadata_df, ctx, dataset=None, panel=None, ce
             provided, that column is renamed to 'celltypes' and used directly,
             skipping the OmiqFilter-based gating assignment. If None, cell types
             are derived from ctx.celltype_gating binary flag columns.
+        numeric_dtype (str or dtype, optional): Downcast numeric columns before
+            concatenation. Use None to preserve the input dtypes.
 
     Returns:
         tuple[pd.DataFrame, list[str]]: (matrix, markers) where matrix is the
@@ -125,6 +158,10 @@ def load_data_from_omiq(data_dir, metadata_df, ctx, dataset=None, panel=None, ce
         # --- Cell type annotation (BEFORE harmonization) ---
         # Must happen first because harmonization strips "OmiqFilter" from column names.
         cell_type_series = None
+        # Keep the complete source-gate list separate from the subset used to
+        # assign cell types. Every original OMIQ helper column is disposable
+        # once the canonical `celltypes` series has been created.
+        all_omiq_gate_cols = [c for c in df.columns if c.startswith("OmiqFilter")]
         # Case 1: user provided the exact column name (e.g. a single "OmiqFilter" string column)
         if celltype_col is not None and celltype_col in df.columns:
             cell_type_series = df[celltype_col].reset_index(drop=True)
@@ -136,33 +173,38 @@ def load_data_from_omiq(data_dir, metadata_df, ctx, dataset=None, panel=None, ce
         # of the specific cell-type gates the user cares about.
         elif any(c.startswith("OmiqFilter") for c in df.columns):
             _allowed = set(ctx.celltype_gating) if ctx.celltype_gating else None
-            gate_cols = {
-                c.replace("OmiqFilter", ""): c
+            assignment_gate_cols = [
+                c
                 for c in df.columns
                 if c.startswith("OmiqFilter")
                 and (_allowed is None or c.replace("OmiqFilter", "") in _allowed)
-            }
-            print(f"  [CT] auto-detected {len(gate_cols)} OmiqFilter gate columns: {list(gate_cols.keys())[:5]}")
-            def _is_positive(val):
-                if val is None:
-                    return False
-                if isinstance(val, bool):
-                    return val
-                try:
-                    return float(val) > 0
-                except (ValueError, TypeError):
-                    return str(val).strip().lower() == "true"
-            def _get_type(row):
-                for name, col in gate_cols.items():
-                    if _is_positive(row.get(col)):
-                        return name
-                return None
-            cell_type_series = df.apply(_get_type, axis=1).reset_index(drop=True)
-            n_assigned = cell_type_series.notna().sum()
-            print(f"  [CT] {n_assigned}/{len(df)} cells assigned a cell type")
+            ]
+            clean_gate_names = [c.replace("OmiqFilter", "") for c in assignment_gate_cols]
+            print(f"  [CT] auto-detected {len(assignment_gate_cols)} OmiqFilter gate columns: {clean_gate_names[:5]}")
+
+            # Reuse the package's canonical gating implementation. It handles
+            # numeric, boolean, and string membership flags and drops cells
+            # that were not assigned to one of the requested gates.
+            df = assign_cell_type(df, ctx, gating_cols=assignment_gate_cols)
+            if "celltypes" in df.columns:
+                cell_type_series = (
+                    df["celltypes"]
+                    .astype("string")
+                    .str.replace(r"^OmiqFilter", "", regex=True)
+                    .reset_index(drop=True)
+                )
+                n_assigned = cell_type_series.notna().sum()
+                print(f"  [CT] {n_assigned}/{len(df)} cells assigned a cell type")
         elif celltype_col is not None:
             avail = [c for c in df.columns if "omiq" in c.lower() or "gate" in c.lower() or "filter" in c.lower()]
             print(f"  [WARN] celltype_col='{celltype_col}' not found. Possible gate columns: {avail[:10]}")
+
+        # Drop all source gate columns, including broad hierarchy gates that
+        # were intentionally not used for cell-type assignment. Without this,
+        # harmonization strips the OmiqFilter prefix and enforce_schema treats
+        # the remaining binary flags as extra markers.
+        if all_omiq_gate_cols:
+            df = df.drop(columns=all_omiq_gate_cols, errors="ignore")
 
         # --- Harmonize marker names (strips OmiqFilter prefix from remaining cols) ---
         df.columns = [
@@ -177,7 +219,13 @@ def load_data_from_omiq(data_dir, metadata_df, ctx, dataset=None, panel=None, ce
             df["celltypes"] = cell_type_series.values
 
         df, file_markers = enforce_schema(df, ctx)
+
         df = add_metadata(df, f, metadata_df=metadata_df, ctx=ctx)
+
+        if numeric_dtype is not None:
+            numeric_cols = df.select_dtypes(include=["float64", "float32", "int64", "int32"]).columns
+            if len(numeric_cols) > 0:
+                df[numeric_cols] = df[numeric_cols].astype(numeric_dtype, copy=False)
 
         # Accumulate markers across files so multi-panel loads capture all markers.
         if markers is None:
@@ -187,6 +235,10 @@ def load_data_from_omiq(data_dir, metadata_df, ctx, dataset=None, panel=None, ce
                 if _m not in markers:
                     markers.append(_m)
 
+        if len(df) == 0:
+            print(f"[LOAD] {file_name} | n_cells=0 after filtering")
+            continue
+
         dfs.append(df)
         print(f"[LOAD] {file_name} | n_cells={len(df)}")
 
@@ -195,7 +247,14 @@ def load_data_from_omiq(data_dir, metadata_df, ctx, dataset=None, panel=None, ce
             f"No files loaded from {data_dir!r}. Check data_dir and metadata_df."
         )
 
-    matrix = pd.concat(dfs, ignore_index=True)
+    matrix = pd.concat(dfs, ignore_index=True, copy=False)
+    categorical_cols = [
+        "original_filename", "dataset", "panel", "plate",
+        "sample_name", "condition", "celltypes",
+    ]
+    for col in categorical_cols:
+        if col in matrix.columns:
+            matrix[col] = matrix[col].astype("category")
     print(f"\n[LOAD] Total: {len(matrix)} cells from {len(dfs)} files ({n_skipped} skipped)")
     return matrix, markers or []
 
@@ -227,6 +286,13 @@ def apply_correction(df, markers, anchor_name, ctx):
     """
     corrected_panels = []
     intermediate_panels = []
+
+    numeric_cols = df.select_dtypes(include=["float64", "float32", "int64", "int32"]).columns
+    if len(numeric_cols) > 0:
+        df[numeric_cols] = df[numeric_cols].astype("float32", copy=False)
+    for col in ["original_filename", "dataset", "panel", "plate", "sample_name", "condition", "celltypes"]:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
 
     # Columns that are OmiqFilter-derived binary flags or gate labels — must not be
     # arcsinh-transformed (they are 0/1 integers, not continuous signal).
@@ -268,7 +334,7 @@ def apply_correction(df, markers, anchor_name, ctx):
         # ── Step 2: Arcsinh transformation ───────────────────────────────────
         # Applied only to continuous signal columns; gate columns are excluded.
         all_data_cols = [c for c in df_group.columns if c not in _non_signal]
-        df_group = arcsinh(df_group, all_data_cols)
+        df_group = arcsinh(df_group, all_data_cols, copy=False, dtype=np.float32)
 
         # Capture time-corrected + arcsinh state (before batch correction).
         intermediate_panels.append(df_group.copy())
@@ -280,14 +346,14 @@ def apply_correction(df, markers, anchor_name, ctx):
         for plate, df_plate in df_group.groupby("plate"):
             if plate == ctx.ref_plate:
                 # Reference plate: time + arcsinh only, no quantile alignment needed.
-                corrected_plates.append(df_plate)
+                corrected_plates.append(df_plate.copy())
                 continue
 
             df_anchor = df_plate[df_plate["sample_name"] == anchor_name]
             if df_anchor.empty or not ref_stats:
                 reason = "no anchor in plate" if df_anchor.empty else "no ref stats"
                 print(f"[SKIP-BATCH] plate={plate} ({reason}) — keeping time-corrected values.")
-                corrected_plates.append(df_plate)
+                corrected_plates.append(df_plate.copy())
             else:
                 corrected_plates.append(
                     batch_correct_plate(df_plate, valid_markers, ref_stats, anchor_name)
@@ -382,24 +448,23 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
         print(f"[REF] {dataset} | {panel} | {plate}")
 
         dfs = []
+        plate_markers = []
         for f in files:
             df = read_cytof_file(f)
-            # If celltypes already exists, assumed to be pre-processed
-            if "celltypes" not in df.columns:
-                df.columns = [harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter","") for c in df.columns]
-                df = apply_marker_schema(df, ctx)
-                df = assign_cell_type(df, ctx)
-                df, markers = enforce_schema(df, ctx)
-            else:
-                df.columns = [harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter","") for c in df.columns]
-                df = apply_marker_schema(df, ctx)
-                df, markers = enforce_schema(df, ctx)
+            df, file_markers = _prepare_correction_file(df, ctx)
+            for marker in file_markers:
+                if marker not in plate_markers:
+                    plate_markers.append(marker)
 
             df = add_metadata(df, f, metadata_df=metadata_df, ctx=ctx)
             dfs.append(df)
 
         # Concatenate all files for this plate
         df_plate = pd.concat(dfs, ignore_index=True)
+        markers = [
+            marker for marker in plate_markers
+            if marker in df_plate.columns and df_plate[marker].notna().any()
+        ]
         # Time drift correction
         df_plate = time_correction(df_plate, panel, ctx)
         
@@ -421,22 +486,23 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
         print(f"[LOAD] #files={len(files)}")
 
         dfs = []
+        plate_markers = []
         for f in files:
             df = read_cytof_file(f)
-            # If celltypes already exists, assumed to be pre-processed
-            if "celltypes" not in df.columns:
-                df.columns = [harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter","") for c in df.columns]
-                df = apply_marker_schema(df, ctx)
-                df = assign_cell_type(df, ctx)
-                df, markers = enforce_schema(df, ctx)
-            else:
-                markers = [c for c in df.columns if c not in ctx.meta_cols and c != "celltypes"]
+            df, file_markers = _prepare_correction_file(df, ctx)
+            for marker in file_markers:
+                if marker not in plate_markers:
+                    plate_markers.append(marker)
 
             df = add_metadata(df, f, metadata_df=metadata_df, ctx=ctx)
             dfs.append(df)
 
         # Concatenate all files for this plate
         df_plate = pd.concat(dfs, ignore_index=True)
+        markers = [
+            marker for marker in plate_markers
+            if marker in df_plate.columns and df_plate[marker].notna().any()
+        ]
 
         print(f"[LOAD] total cells={len(df_plate)}")
         print(f"[LOAD] markers={len(markers)}")
@@ -445,7 +511,12 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
         df_plate = time_correction(df_plate, panel, ctx)
 
         # SAVE RAW TIME-CORRECTED RESULTS (FOR VISUALIZATION)
-        time_dir = os.path.join(ctx.output_dir, "time_corrected")
+        path_parts = [
+            _safe_path_component(dataset),
+            _safe_path_component(panel),
+            _safe_path_component(plate),
+        ]
+        time_dir = os.path.join(ctx.output_dir, "time_corrected", *path_parts)
         os.makedirs(time_dir, exist_ok=True)
 
         for original_name, df_sample in df_plate.groupby("original_filename"):
@@ -481,7 +552,10 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
                 # Apply batch correction using reference statistics
                 df_corrected = batch_correct_plate(df_plate, markers, ref_stats, anchor_sample)
 
-        # SAVE: Write corrected data for each sample to output directory
+        # SAVE: isolate corrected files by dataset/panel/plate to prevent
+        # same-named files from different studies from overwriting each other.
+        corrected_dir = os.path.join(ctx.output_dir, "corrected", *path_parts)
+        os.makedirs(corrected_dir, exist_ok=True)
         for original_name, df_sample in df_corrected.groupby("original_filename"):
             # Drop the helper column before saving
             df_to_save = df_sample.drop(columns=["original_filename"], errors="ignore")
@@ -492,8 +566,7 @@ def run_cytof_correction(dataset_to_process, config_path=None, metadata_path=Non
             else:
                 out_name = f"{base}.csv"
                 
-            out_path = os.path.join(ctx.output_dir, out_name)
-            os.makedirs(ctx.output_dir, exist_ok=True)
+            out_path = os.path.join(corrected_dir, out_name)
             df_to_save.to_csv(out_path, index=False)
             print(f"[SAVE] corrected result as CSV={out_name} | path={out_path}")
 
@@ -592,17 +665,16 @@ def run_time_analysis(datasets=None, plates_to_visualize=None, verbose=True, con
             var_a.to_csv(os.path.join(path_Variance, f"variance_after_{dataset}_{panel}.csv"))
 
             # 2.2 Marker-level Variance Boxplots (Time Correction)
-            # Group by sample_name so each group is one run; Time is the only factor.
-            # This isolates within-sample time drift — the signal time correction actually removes.
+            # Compare all metadata factors across markers before and after time correction.
             print(f"[ANALYZE] Generating Marker-level variance boxplots (Time)...")
-            mvar_b = variation_marker(df_b, markers=markers, group_col='sample_name', info_cols=['Time'], panel=panel)
-            mvar_a = variation_marker(df_a, markers=markers, group_col='sample_name', info_cols=['Time'], panel=panel)
+            mvar_b = variation_marker(df_b, markers=markers, group_col=None, info_cols=factors, panel=panel)
+            mvar_a = variation_marker(df_a, markers=markers, group_col=None, info_cols=factors, panel=panel)
 
             # Save the raw marker-level variance data to CSV
             mvar_b.to_csv(os.path.join(path_Variance, f"variance_marker_raw_before_{dataset}_{panel}_Time.csv"), index=False)
             mvar_a.to_csv(os.path.join(path_Variance, f"variance_marker_raw_after_{dataset}_{panel}_Time.csv"), index=False)
 
-            plot_variance_marker_boxplot(mvar_b, mvar_a, save_path=os.path.join(path_Variance, f"variance_marker_boxplot_{dataset}_{panel}_Time.png"), use_log=False)
+            plot_variance_marker_boxplot(mvar_b, mvar_a, save_path=os.path.join(path_Variance, f"variance_marker_boxplot_{dataset}_{panel}_Time.png"), use_log=True)
 
             # 3. UMAP
             print(f"[ANALYZE] Generating UMAP...")
@@ -873,7 +945,8 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000, config
             all_umap_markers[(dataset, panel)] = umap_markers
 
             # Plate effect
-            umap_plate_effect(df_b, df_a, markers=umap_markers, subsample=subsample_umap,
+            umap_plate_effect(df_b, df_a, markers=umap_markers, anchor_name=anchor_name,
+                                subsample=subsample_umap,
                                 save_path=os.path.join(path_UMAP, f"umap_plate_effect_{dataset}_{panel}_Batch.png"))
 
             # Batch Evaluation
@@ -897,6 +970,7 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000, config
                 df_raw=df_b, 
                 df_corr=df_a, 
                 markers=analysis_markers, 
+                ref_plate=ctx.ref_plate,
                 cluster_col=cluster_param,
                 anchor=anchor_name, 
                 n_sample=50000, 
@@ -971,19 +1045,34 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000, config
 
                     # 2. Check CORRECTED file
                     cf_base = os.path.splitext(f_name)[0]
-                    cf_path = os.path.join(ctx.output_dir, f"{cf_base}.csv")
-                    is_uncorrected = False
-                    if not os.path.exists(cf_path):
-                        cf_path = os.path.join(ctx.output_dir, f"{cf_base}_UNCORRECTED.csv")
-                        is_uncorrected = True
-                    
-                    if os.path.exists(cf_path):
-                        if is_uncorrected: continue
-                        header_c = pd.read_csv(cf_path, nrows=0)
-                        if 'Time' not in header_c.columns:
-                            print(f"  [SKIP-FILE] Corrected file '{os.path.basename(cf_path)}' missing 'Time'. Skipping visualization.")
-                            continue
-                    else:
+                    corrected_dir = os.path.join(
+                        ctx.output_dir,
+                        "corrected",
+                        _safe_path_component(dataset),
+                        _safe_path_component(panel),
+                        _safe_path_component(row.get("plate", "Unknown")),
+                    )
+                    corrected_candidates = [
+                        os.path.join(corrected_dir, f"{cf_base}.csv"),
+                        # Backward compatibility with legacy flat outputs.
+                        os.path.join(ctx.output_dir, f"{cf_base}.csv"),
+                    ]
+                    cf_path = next(
+                        (candidate for candidate in corrected_candidates if os.path.exists(candidate)),
+                        None,
+                    )
+                    if cf_path is None:
+                        uncorrected_candidates = [
+                            os.path.join(corrected_dir, f"{cf_base}_UNCORRECTED.csv"),
+                            os.path.join(ctx.output_dir, f"{cf_base}_UNCORRECTED.csv"),
+                        ]
+                        if any(os.path.exists(candidate) for candidate in uncorrected_candidates):
+                            print(f"  [SKIP-FILE] '{f_name}' was not batch-corrected.")
+                        continue
+
+                    header_c = pd.read_csv(cf_path, nrows=0)
+                    if 'Time' not in header_c.columns:
+                        print(f"  [SKIP-FILE] Corrected file '{os.path.basename(cf_path)}' missing 'Time'. Skipping visualization.")
                         continue
                     
                     # --- ALL CHECKS PASSED: START ACTUAL LOADING ---
@@ -1007,59 +1096,34 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000, config
                         rdf_sub[col] = rdf_sub[col].astype('category')
                     dfs_raw.append(rdf_sub)
 
-                    # 2. Handle CORRECTED data (Look in ctx.output_dir)
-                    # cf_path was already determined in pre-check section
-                    is_uncorrected = "_UNCORRECTED" in os.path.basename(cf_path)
-                    
-                    if os.path.exists(cf_path):
-                        cdf_full = read_cytof_file(cf_path)
-                        cdf_full.columns = [harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter","") for c in cdf_full.columns]
-                        
-                        # Use analysis_markers + Time for visualization since pre-check confirmed Time exists
-                        needed_cols_a = analysis_markers + ['Time']
-                        actual_cols_a = [c for c in needed_cols_a if c in cdf_full.columns]
-                        
-                        cdf_sub = cdf_full.sample(n=min(len(cdf_full), subsample_per_file), random_state=42)[actual_cols_a].astype('float32').copy()
-                        del cdf_full
-                        
-                        cdf_sub['plate'] = str(row.get('plate', 'Unknown'))
-                    is_uncorrected = False
-                    
-                    if not os.path.exists(cf_path):
-                        cf_path = os.path.join(ctx.output_dir, f"{cf_base}_UNCORRECTED.csv")
-                        is_uncorrected = True
-                    
-                    if os.path.exists(cf_path):
-                        if is_uncorrected:
-                            continue
-                            
-                        cdf_full = read_cytof_file(cf_path)
-                        cdf_full.columns = [harmonize_marker(c) if not c.startswith("OmiqFilter") else c.replace("OmiqFilter","") for c in cdf_full.columns]
-                        
-                        # Use analysis_markers + Time for visualization if available
-                        needed_cols_a = analysis_markers.copy()
-                        if 'Time' in cdf_full.columns:
-                            needed_cols_a.append('Time')
-                        
-                        actual_cols_a = [c for c in needed_cols_a if c in cdf_full.columns]
-                        
-                        cdf_sub = cdf_full.sample(n=min(len(cdf_full), subsample_per_file), random_state=42)[actual_cols_a].astype('float32').copy()
-                        del cdf_full
-                        
-                        if 'Time' not in cdf_sub.columns and 'Time' in rdf_sub.columns:
-                            # Direct index assignment only works if lengths match (which they don't due to random sampling)
-                            rdf_sub_sync = rdf_sub.copy() # Already has Time
-                            cdf_sub['Time'] = rdf_sub_sync.head(len(cdf_sub))['Time'].values # Approximation or re-read
-                            pass
+                    # 2. Load the already-resolved corrected file exactly once.
+                    cdf_full = read_cytof_file(cf_path)
+                    cdf_full.columns = [
+                        harmonize_marker(c)
+                        if not c.startswith("OmiqFilter")
+                        else c.replace("OmiqFilter", "")
+                        for c in cdf_full.columns
+                    ]
+                    needed_cols_a = analysis_markers + ["Time"]
+                    actual_cols_a = [c for c in needed_cols_a if c in cdf_full.columns]
+                    cdf_sub = (
+                        cdf_full.sample(
+                            n=min(len(cdf_full), subsample_per_file),
+                            random_state=42,
+                        )[actual_cols_a]
+                        .astype("float32")
+                        .copy()
+                    )
+                    del cdf_full
 
-                        cdf_sub['plate'] = str(row.get('plate', 'Unknown'))
-                        cdf_sub['sample_name'] = sample_name
-                        cdf_sub['condition'] = str(row.get('condition', 'Unknown'))
-                        cdf_sub['panel'] = str(panel)
-                        
-                        for col in ['plate', 'sample_name', 'condition', 'panel']:
-                            cdf_sub[col] = cdf_sub[col].astype('category')
-                        dfs_corr_vis.append(cdf_sub)
+                    cdf_sub["plate"] = str(row.get("plate", "Unknown"))
+                    cdf_sub["sample_name"] = sample_name
+                    cdf_sub["condition"] = str(row.get("condition", "Unknown"))
+                    cdf_sub["panel"] = str(panel)
+
+                    for col in ["plate", "sample_name", "condition", "panel"]:
+                        cdf_sub[col] = cdf_sub[col].astype("category")
+                    dfs_corr_vis.append(cdf_sub)
                 
                 if dfs_raw and dfs_corr_vis:
                     df_raw_vis = pd.concat(dfs_raw, ignore_index=True)
@@ -1146,6 +1210,7 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000, config
                         df_corrected_P2=all_dfs[p2_key]["after"] if p2_key else None,
                         markers_P1=all_umap_markers.get(p1_key, all_markers[p1_key]),
                         markers_P2=all_umap_markers.get(p2_key, all_markers[p2_key]) if p2_key else None,
+                        anchor_name=ctx.anchors.get(dataset),
                         save_dir=path_shared_comp
                     )
                 else:
