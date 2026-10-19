@@ -38,6 +38,10 @@ secrets*.json
 
 # Local method experiments and paper analyses
 /local_*/
+/benchmark_cytofruv_d0/
+/benchmark_cytonorm_d0/
+/external_validation_z247/
+/paper_analysis/
 
 # ---------------------------------------------------------------------------
 # Python
@@ -72,6 +76,11 @@ dist/
 # ---------------------------------------------------------------------------
 # Editors and operating systems
 # ---------------------------------------------------------------------------
+.agents/
+.codex/
+.codex_previews/
+.cursor/
+.claude/
 .vscode/
 .idea/
 *.code-workspace
@@ -87,3 +96,8 @@ Desktop.ini
 *.tmp
 *.temp
 ~$*
+
+# Local handover bundles (review and transfer outside Git)
+/local_handover_*/
+/CyTOF-CI_handover_*.zip
+/CyTOF-CI_handover_*.zip.sha256.txt

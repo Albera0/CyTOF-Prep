@@ -4,11 +4,13 @@ A modular Python package for CyTOF (Cytometry by Time-of-Flight) data processing
 
 ## Project Structure
 
-- `pipeline.py`: Command-line interface.
-- `correction.py`: Core algorithms for time-drift and batch effect correction.
-- `utils.py`: Shared utilities for configuration management, data transformation, and metadata handling.
-- `time_correction_visualization.py`: Statistical and visual metrics for time-drift correction evaluation.
-- `batch_correction_visualization.py`: Statistical and visual metrics for batch effect correction evaluation.
+- `src/pipeline.py`: Command-line interface.
+- `src/correction.py`: Core algorithms for time-drift and batch effect correction.
+- `src/utils.py`: Shared utilities for configuration management, data transformation, and metadata handling.
+- `src/time_correction_visualization.py`: Statistical and visual metrics for time-drift correction evaluation.
+- `src/batch_correction_visualization.py`: Statistical and visual metrics for batch effect correction evaluation.
+- `examples/`: Output-cleared preparation, correction, and visualization notebooks.
+- `metadata/`: Generic JSON and spreadsheet configuration examples.
 
 ## Getting Started
 
@@ -55,25 +57,25 @@ The pipeline can be executed in distinct stages:
 
 **Stage 1: Correction (Data Processing)**
 ```powershell
-python -m CyTof_BatchCorrection.pipeline correction --dataset D0
+python -m src.pipeline correction --dataset D0 --config metadata/meta.json
 ```
 *Applies correction algorithms and saves processed files to the output directory.*
 
 **Stage 2: Time Analysis (Visualization and Evaluation)**
 ```powershell
-python -m CyTof_BatchCorrection.pipeline time-analysis --dataset D0
+python -m src.pipeline time-analysis --dataset D0 --config metadata/meta.json
 ```
 *Generates PCA, density plots... to evaluate time-drift correction.*
 
 **Stage 3: Batch Analysis (Visualization and Evaluation)**
 ```powershell
-python -m CyTof_BatchCorrection.pipeline batch-analysis --dataset D0
+python -m src.pipeline batch-analysis --dataset D0 --config metadata/meta.json
 ```
 *Generates UMAP projections, EMD scores, marker correlations... for batch effect evaluation.*
 
 ### Full Pipeline Execution
 ```powershell
-python -m CyTof_BatchCorrection.pipeline all --dataset D0
+python -m src.pipeline all --dataset D0 --config metadata/meta.json
 ```
 
 ## Result Analysis Guide
