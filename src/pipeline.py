@@ -18,6 +18,7 @@ from glob import glob
 from collections import defaultdict
 from .utils import *
 from .correction import *
+from .correction import _validate_stable_marker
 from .time_correction_visualization import *
 from .batch_correction_visualization import *
 
@@ -274,7 +275,8 @@ def apply_correction(df, markers, anchor_name, ctx):
         markers (list[str]): Biological marker column names (from load_data_from_omiq).
             Only these are used for batch correction (gate/flag columns excluded).
         anchor_name (str): 'sample_name' value of the inter-plate anchor sample.
-        ctx (CyTOFContext): Pipeline config (ref_plate, meta_cols, celltype2correct…).
+        ctx (CyTOFContext): Pipeline config (ref_plate, meta_cols, celltype2correct,
+            and stable_marker as one non-empty reference-column name).
 
     Returns:
         tuple[pd.DataFrame, pd.DataFrame]:
@@ -284,6 +286,7 @@ def apply_correction(df, markers, anchor_name, ctx):
                              as the saved pre-batch baseline for diagnostics.
             - corrected    : fully corrected (time + arcsinh + batch).
     """
+    _validate_stable_marker(ctx.stable_marker)
     corrected_panels = []
     intermediate_panels = []
 
@@ -864,9 +867,10 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000, config
             path_AnchorCorrection = os.path.join(base_panel_dir, "Batch_AnchorCorrectionSignal")
             path_UMAP = os.path.join(base_panel_dir, "Batch_UMAP")
             path_EMD = os.path.join(base_panel_dir, "Batch_EMD")
+            path_KDE = os.path.join(base_panel_dir, "Batch_KDE_JSD")
             path_MarkerCorr = os.path.join(base_panel_dir, "Batch_MarkerCorrelation")
             
-            for d in [path_Variance, path_AnchorSignal, path_AnchorCorrection, path_UMAP, path_EMD, path_MarkerCorr]:
+            for d in [path_Variance, path_AnchorSignal, path_AnchorCorrection, path_UMAP, path_EMD, path_KDE, path_MarkerCorr]:
                 os.makedirs(d, exist_ok=True)
             
             # 2. PCA Variance Analysis
@@ -979,9 +983,36 @@ def run_batch_analysis(datasets=None, verbose=True, subsample_umap=50000, config
             plot_emd(emd_df, mad_score, save_path=path_EMD)
             plot_emd_per_marker(emd_df, save_path=path_EMD)
 
+            # 5.2 Shift-invariant KDE-JSD for repeated technical anchors
+            print(f"[ANALYZE] Computing anchor KDE-JSD...")
+            kde_jsd_df = compute_kde_jsd(
+                df_raw=df_b,
+                df_corr=df_a,
+                markers=analysis_markers,
+                ref_plate=ctx.ref_plate,
+                anchor=anchor_name,
+                n_sample=20000,
+                random_state=42,
+                save_dir=path_KDE,
+            )
+            plot_kde_jsd(
+                kde_jsd_df,
+                save_path=os.path.join(
+                    path_KDE,
+                    f"kde_jsd_before_after_{dataset}_{panel}.png",
+                ),
+            )
+
             # 6. Marker Correlation
             print(f"[ANALYZE] Marker Correlation...")
-            marker_corr(df_before=df_b, df_after=df_a, markers=analysis_markers, save_dir=path_MarkerCorr, group_col='condition',)
+            marker_corr(
+                df_before=df_b,
+                df_after=df_a,
+                markers=analysis_markers,
+                save_dir=path_MarkerCorr,
+                group_col='condition',
+                include_overall=True,
+            )
 
             # 7. Celltype Variance (Pre-storage)
             v_ct_b, v_ct_a = compute_celltype_variance(df_b, df_a, ctx=ctx)

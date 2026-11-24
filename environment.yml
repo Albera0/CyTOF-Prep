@@ -1,0 +1,26 @@
+name: cytof-ci
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8.20
+  - pip
+  - numpy=1.24.4
+  - pandas=2.0.3
+  - scipy=1.10.1
+  - scikit-learn=1.2.2
+  - matplotlib=3.7.5
+  - seaborn=0.13.2
+  - statsmodels=0.14.1
+  - patsy=1.0.2
+  - openpyxl=3.1.5
+  - ipykernel=6.29.5
+  - pip:
+      - scanpy==1.9.8
+      - anndata==0.9.2
+      - FlowCytometryTools==0.5.1
+      - fcswrite==0.6.4
+      - umap-learn==0.5.7
+      - somoclu==1.7.4
+      - scib==1.1.5
+      - pypalettes==0.1.0

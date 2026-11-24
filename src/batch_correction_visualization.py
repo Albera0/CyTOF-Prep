@@ -20,6 +20,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score, silhouette_samples, adjusted_rand_score
 from sklearn.cluster import KMeans
 from scipy.stats import chi2, wasserstein_distance, median_abs_deviation, pearsonr, wilcoxon, mannwhitneyu, ttest_rel
+from scipy.ndimage import gaussian_filter1d
+from scipy.spatial.distance import jensenshannon
 from scipy.sparse.csgraph import connected_components
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
@@ -351,6 +353,57 @@ def visualize_anchor_celltype_across_plates(
             plt.close(fig)
 
 
+def validate_paired_data(df_before, df_after, batch_key='plate', label_key=None):
+    """Check corresponding row positions without matching or reordering cells.
+
+    Compare shared event_id/cell_id/__paired_cell_id, acquisition metadata and
+    other shared metadata, treating missing values as
+    equal. A unique event key or matching non-default unique indices provides
+    identity evidence. Otherwise warn: equal lengths/default indices alone do
+    not establish cell identity. CSV callers must preserve event order.
+    """
+    if len(df_before) != len(df_after):
+        raise ValueError("Paired evaluation requires equal Before/After cell counts; truncation is not allowed.")
+    if df_before.empty:
+        raise ValueError("Paired evaluation requires non-empty Before/After data.")
+    for col in [batch_key, label_key]:
+        if col is not None and (col not in df_before or col not in df_after):
+            raise ValueError(f"Paired evaluation requires column {col!r} in both inputs.")
+
+    event_ids = ['event_id', 'cell_id', '__paired_cell_id']
+    metadata = event_ids + ['original_filename', 'Time', 'Event_length', 'dataset',
+                            'panel', 'plate', 'sample_name', 'condition', 'donor',
+                            'celltypes', 'cell_type', 'group', batch_key, label_key]
+    shared = list(dict.fromkeys(c for c in metadata if c is not None
+                                and c in df_before and c in df_after))
+    for col in shared:
+        left = df_before[col].astype(object).reset_index(drop=True)
+        right = df_after[col].astype(object).reset_index(drop=True)
+        same = (left.eq(right) | (left.isna() & right.isna())).fillna(False)
+        if not same.all():
+            row = int(np.flatnonzero(~same.to_numpy())[0])
+            raise ValueError(f"Before/After pairing mismatch in {col!r} at row position {row}.")
+
+    identified = any(c in shared and df_before[c].notna().all()
+                     and df_before[c].is_unique for c in event_ids)
+    acquisition_key = [c for c in ['dataset', 'panel', 'plate', 'original_filename',
+                                   'Time', 'Event_length'] if c in shared]
+    if 'original_filename' in acquisition_key and 'Time' in acquisition_key:
+        identified |= (not df_before[acquisition_key].isna().any().any()
+                       and not df_before.duplicated(acquisition_key).any())
+    meaningful_indices = [frame.index.is_unique
+                          and not frame.index.equals(pd.RangeIndex(len(frame)))
+                          for frame in (df_before, df_after)]
+    if not identified and any(meaningful_indices):
+        if not df_before.index.equals(df_after.index):
+            raise ValueError("Before/After non-default indices differ; verify event correspondence before evaluation.")
+        identified = all(meaningful_indices)
+    if not identified:
+        warnings.warn("Cell identity cannot be verified from these inputs. Shared metadata agree, "
+                      "but paired evaluation assumes corresponding event order; preserve event IDs or source indices.",
+                      RuntimeWarning, stacklevel=2)
+
+
 def _balanced_paired_anchor_subset(
     df_before,
     df_after,
@@ -394,9 +447,8 @@ def _balanced_paired_anchor_subset(
             f"[UMAP][WARN] Anchor sample {anchor_name!r} is unavailable in "
             f"plate/panel groups {missing_anchor_groups}; those groups are excluded."
         )
-    # CytoNorm exports can reorder files/groups, so the global DataFrame index is
-    # not a stable cell identifier. Pair rows by their position *within* each
-    # metadata group; conversion/correction preserves the event order per file.
+    # Pair within metadata groups, checking event order/counts before sampling.
+    # This allows group reordering, but does not match cells across files.
     before_groups = before.groupby(list(group_cols), observed=True, sort=True)
     after_groups = after.groupby(list(group_cols), observed=True, sort=True)
     group_keys = sorted(set(before_groups.groups) & set(after_groups.groups), key=str)
@@ -404,10 +456,11 @@ def _balanced_paired_anchor_subset(
         raise ValueError(f"No plate groups found for anchor sample {anchor_name!r}.")
 
     rng = np.random.default_rng(random_state)
-    paired_sizes = [
-        min(len(before_groups.get_group(key)), len(after_groups.get_group(key)))
-        for key in group_keys
-    ]
+    paired_sizes = []
+    for key in group_keys:
+        validate_paired_data(before_groups.get_group(key), after_groups.get_group(key),
+                             batch_key=group_cols[0])
+        paired_sizes.append(len(before_groups.get_group(key)))
     n_per_group = int(min(paired_sizes))
     if max_cells is not None:
         n_per_group = min(n_per_group, max(1, int(max_cells) // len(group_keys)))
@@ -416,7 +469,7 @@ def _balanced_paired_anchor_subset(
     for key in group_keys:
         before_group = before_groups.get_group(key).reset_index(drop=True)
         after_group = after_groups.get_group(key).reset_index(drop=True)
-        paired_size = min(len(before_group), len(after_group))
+        paired_size = len(before_group)
         chosen_positions = rng.choice(paired_size, size=n_per_group, replace=False)
         before_selected.append(before_group.iloc[chosen_positions])
         after_selected.append(after_group.iloc[chosen_positions])
@@ -844,6 +897,269 @@ def umap_celltype_by_plate(
     return adata
 
 
+def aligned_kde_js(reference, target):
+    """Return shift-invariant KDE Jensen-Shannon distance and best shift.
+
+    The two samples are evaluated on a shared padded grid with a pooled
+    Silverman bandwidth. The target density is translated over a bounded
+    one-dimensional search, and the minimum base-2 Jensen-Shannon distance is
+    returned: sqrt(Jensen-Shannon divergence), using base-2 logarithms (0 to 1).
+    Non-finite samples are discarded; fewer than two finite observations returns
+    (NaN, NaN). Constants and all-zero signals use the same bandwidth floor.
+    """
+    reference = np.asarray(reference, dtype=float)
+    target = np.asarray(target, dtype=float)
+    reference = reference[np.isfinite(reference)]
+    target = target[np.isfinite(target)]
+    if len(reference) < 2 or len(target) < 2:
+        return np.nan, np.nan
+
+    pooled = np.concatenate([reference, target])
+    q001, q25, q75, q999 = np.quantile(pooled, [0.001, 0.25, 0.75, 0.999])
+    robust_scale = max(float((q75 - q25) / 1.349), float(np.std(pooled)), 1e-3)
+    core_span = max(float(q999 - q001), 4.0 * robust_scale, 0.25)
+    max_shift = max(2.0 * robust_scale, 0.25 * core_span)
+    edges = np.linspace(
+        q001 - max_shift - 0.15 * core_span,
+        q999 + max_shift + 0.15 * core_span,
+        513,
+    )
+    bin_width = float(edges[1] - edges[0])
+
+    pooled_n = max(min(len(reference), len(target)), 2)
+    bandwidth = 0.9 * robust_scale * pooled_n ** (-1.0 / 5.0)
+    sigma_bins = max(bandwidth / bin_width, 1.5)
+    if not np.isfinite(edges).all() or not np.isfinite(sigma_bins) or bin_width <= 0:
+        warnings.warn("KDE-JSD grid/bandwidth is not finite; returning NaN.", RuntimeWarning)
+        return np.nan, np.nan
+    try:
+        density_ref = gaussian_filter1d(
+            np.histogram(reference, bins=edges)[0].astype(float),
+            sigma_bins,
+            mode="constant",
+        )
+        density_target = gaussian_filter1d(
+            np.histogram(target, bins=edges)[0].astype(float),
+            sigma_bins,
+            mode="constant",
+        )
+    except (ValueError, FloatingPointError, OverflowError) as error:
+        warnings.warn(f"KDE-JSD density calculation failed: {error}; returning NaN.", RuntimeWarning)
+        return np.nan, np.nan
+    density_ref = np.maximum(density_ref, 0)
+    density_target = np.maximum(density_target, 0)
+    if density_ref.sum() <= 0 or density_target.sum() <= 0:
+        return np.nan, np.nan
+    density_ref /= density_ref.sum()
+
+    max_shift_bins = min(int(np.ceil(max_shift / bin_width)), len(density_ref) // 3)
+    best_distance = np.inf
+    best_shift_bins = 0
+    for shift_bins in range(-max_shift_bins, max_shift_bins + 1):
+        shifted = np.zeros_like(density_target)
+        if shift_bins < 0:
+            shifted[:shift_bins] = density_target[-shift_bins:]
+        elif shift_bins > 0:
+            shifted[shift_bins:] = density_target[:-shift_bins]
+        else:
+            shifted[:] = density_target
+        total = shifted.sum()
+        if total <= 0:
+            continue
+        shifted /= total
+        distance = float(jensenshannon(density_ref, shifted, base=2))
+        if distance < best_distance:
+            best_distance = distance
+            best_shift_bins = shift_bins
+
+    if not np.isfinite(best_distance):
+        return np.nan, np.nan
+    return best_distance, float(best_shift_bins * bin_width)
+
+
+def compute_kde_jsd(
+    df_raw,
+    df_corr,
+    markers,
+    ref_plate,
+    anchor=None,
+    plate_col="plate",
+    sample_col="sample_name",
+    n_sample=20000,
+    random_state=42,
+    save_dir=None,
+):
+    """Calculate base-2 Jensen-Shannon distances for marker-target plate pairs.
+
+    Sample finite values independently within each state/plate/marker, without
+    replacement, up to n_sample (default 20000); seed defaults to 42. Reusing
+    seeds is reproducibility, not a guarantee of event-identity pairing.
+    KDE_JSD_* field names are retained; values are distances, not divergences.
+    """
+    raw = df_raw
+    corr = df_corr
+    if raw.empty or corr.empty:
+        return pd.DataFrame()
+    required = [plate_col] + ([sample_col] if anchor is not None else [])
+    for col in required:
+        if col not in raw or col not in corr:
+            raise ValueError(f"KDE-JSD requires column {col!r} in both inputs.")
+    if anchor is not None:
+        raw = raw[raw[sample_col].astype(str) == str(anchor)]
+        corr = corr[corr[sample_col].astype(str) == str(anchor)]
+    if raw.empty or corr.empty:
+        print("  [WARN] No anchor cells available for KDE-JSD.")
+        return pd.DataFrame()
+
+    ref_label = str(ref_plate)
+    raw_plates = set(raw[plate_col].astype(str).unique())
+    corr_plates = set(corr[plate_col].astype(str).unique())
+    target_plates = sorted((raw_plates & corr_plates) - {ref_label})
+    if ref_label not in raw_plates or ref_label not in corr_plates:
+        print(f"  [WARN] Reference plate '{ref_plate}' is missing for KDE-JSD.")
+        return pd.DataFrame()
+
+    def sampled_values(frame, plate, marker, seed):
+        values = pd.to_numeric(
+            frame.loc[frame[plate_col].astype(str) == plate, marker],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if len(values) > n_sample:
+            values = np.random.default_rng(seed).choice(values, n_sample, replace=False)
+        return values
+
+    rows = []
+    available_markers = [m for m in markers if m in raw.columns and m in corr.columns]
+    for marker_index, marker in enumerate(available_markers):
+        ref_seed = random_state + marker_index * 1009
+        for plate_index, target_plate in enumerate(target_plates):
+            target_seed = ref_seed + plate_index + 1
+            raw_ref = sampled_values(raw, ref_label, marker, ref_seed)
+            raw_target = sampled_values(raw, target_plate, marker, target_seed)
+            corr_ref = sampled_values(corr, ref_label, marker, ref_seed)
+            corr_target = sampled_values(corr, target_plate, marker, target_seed)
+            raw_distance, raw_shift = aligned_kde_js(raw_ref, raw_target)
+            corr_distance, corr_shift = aligned_kde_js(corr_ref, corr_target)
+            rows.append({
+                "plate1": ref_label,
+                "plate2": target_plate,
+                "marker": marker,
+                "KDE_JSD_raw": raw_distance,
+                "KDE_JSD_corr": corr_distance,
+                "KDE_JSD_reduction": raw_distance - corr_distance,
+                "best_shift_raw": raw_shift,
+                "best_shift_corr": corr_shift,
+                "n_reference_raw": len(raw_ref),
+                "n_target_raw": len(raw_target),
+                "n_reference_corr": len(corr_ref),
+                "n_target_corr": len(corr_target),
+            })
+
+    results = pd.DataFrame(rows)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        results.to_csv(os.path.join(save_dir, "kde_jsd_results.csv"), index=False)
+    return results
+
+
+def plot_kde_jsd(kde_jsd_df, save_path=None):
+    """Summarize paired distances, one unit per marker-target plate pair.
+
+    The existing two-sided Wilcoxon pools available marker/plate pairs without
+    BH correction. These units share references and are not independent
+    biological replicates. This pairs distance summaries, not sampled cells.
+    """
+    if kde_jsd_df is None or kde_jsd_df.empty:
+        print("  [WARN] No KDE-JSD results available to plot.")
+        return pd.DataFrame()
+
+    kde_jsd_df = kde_jsd_df.replace([np.inf, -np.inf], np.nan)
+    paired = kde_jsd_df[["KDE_JSD_raw", "KDE_JSD_corr"]].dropna()
+    statistic = np.nan
+    p_value = np.nan
+    if not paired.empty and not np.allclose(
+        paired["KDE_JSD_raw"], paired["KDE_JSD_corr"]
+    ):
+        test = wilcoxon(paired["KDE_JSD_raw"], paired["KDE_JSD_corr"])
+        statistic, p_value = float(test.statistic), float(test.pvalue)
+
+    statistics = pd.DataFrame([{
+        "paired_unit": "marker-plate pair",
+        "n_pairs": len(paired),
+        "mean_before": paired["KDE_JSD_raw"].mean(),
+        "mean_after": paired["KDE_JSD_corr"].mean(),
+        "median_before": paired["KDE_JSD_raw"].median(),
+        "median_after": paired["KDE_JSD_corr"].median(),
+        "wilcoxon_statistic": statistic,
+        "p_value": p_value,
+    }])
+
+    if paired.empty:
+        warnings.warn("No finite Before/After KDE-JSD pairs; no plot or test is produced.", RuntimeWarning)
+        if save_path:
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+            statistics.to_csv(os.path.join(os.path.dirname(save_path), "kde_jsd_statistics.csv"), index=False)
+        return statistics
+
+    plot_data = kde_jsd_df.melt(
+        id_vars=["marker", "plate2"],
+        value_vars=["KDE_JSD_raw", "KDE_JSD_corr"],
+        var_name="stage",
+        value_name="KDE-JSD",
+    )
+    plot_data["stage"] = plot_data["stage"].map(
+        {"KDE_JSD_raw": "Before", "KDE_JSD_corr": "After"}
+    )
+    fig, ax = plt.subplots(figsize=(6.4, 5.6))
+    sns.boxplot(
+        data=plot_data,
+        x="stage",
+        y="KDE-JSD",
+        hue="stage",
+        order=["Before", "After"],
+        palette={"Before": _BEFORE_COLOR, "After": _AFTER_COLOR},
+        dodge=False,
+        legend=False,
+        width=0.45,
+        showfliers=False,
+        ax=ax,
+    )
+    sns.stripplot(
+        data=plot_data,
+        x="stage",
+        y="KDE-JSD",
+        order=["Before", "After"],
+        color="#34495E",
+        size=4,
+        alpha=0.55,
+        jitter=0.12,
+        ax=ax,
+    )
+    if np.isfinite(p_value):
+        ax.text(
+            0.5, 0.98, f"Paired Wilcoxon P={p_value:.2e}",
+            transform=ax.transAxes, ha="center", va="top",
+        )
+    ax.set_xlabel("")
+    ax.set_ylabel("Shift-invariant KDE-JSD (lower is better)")
+    ax.set_title("Anchor distribution-shape alignment")
+    ax.grid(axis="y", alpha=0.2)
+    sns.despine(ax=ax)
+    fig.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        _savefig(save_path, fig=fig, dpi=300, bbox_inches="tight")
+        statistics.to_csv(
+            os.path.join(os.path.dirname(save_path), "kde_jsd_statistics.csv"),
+            index=False,
+        )
+    else:
+        plt.show()
+    plt.close(fig)
+    return statistics
+
+
 # Compute EMD between raw and normalized distributions for each marker, plate, and optionally cell type
 def compute_emd_mad(
     df_raw,
@@ -1035,17 +1351,35 @@ def compute_emd_mad(
     return emd_df, mad_df, mad_score
 
 
-# Plot density/violin style EMD per SOM node per marker in a paper-style format
+# Plot global and per-target-plate EMD summaries.
+def _emd_all_zero_finite_pairs(before, after):
+    """Identify the untestable all-zero-difference case without assigning a p-value."""
+    before = np.asarray(before, dtype=float)
+    after = np.asarray(after, dtype=float)
+    finite = np.isfinite(before) & np.isfinite(after)
+    return finite.any() and np.equal(before[finite], after[finite]).all()
+
+
 def plot_emd(emd_df, mad_score, save_path=None):
     """
     Main EMD visualization suite.
     
     1. Global KDE Plot: Shows the overall shift in distribution (Raw vs Corrected).
-    2. Boxplots per target plate: EMD to the reference plate for all markers.
+    2. Boxplots per target plate: one mean EMD value per marker, averaged
+       across cell populations.
     3. Per-Plate KDE: Detailed look at individual batch reduction efficiency.
+
+    Global two-sided Wilcoxon pairs input rows (marker x target plate x SOM
+    node/population), without BH adjustment. Per-plate tests pair markers after
+    averaging nodes/populations; BH covers successfully computed target-plate
+    tests in this call. The two summaries have different statistical units.
+    All-zero finite paired differences are not testable (NaN), receive no stars,
+    and are excluded from the per-plate BH family.
     """
 
     # Create directory if needed
+    if emd_df is None or emd_df.empty:
+        raise ValueError("EMD plotting requires non-empty paired EMD results.")
     if save_path is not None and not os.path.exists(save_path):
         os.makedirs(save_path, exist_ok=True)
 
@@ -1059,16 +1393,25 @@ def plot_emd(emd_df, mad_score, save_path=None):
     mad_median = mad_score["MAD_score"].median() if not mad_score.empty else np.nan
 
     # Calculate p-value (Wilcoxon Signed-Rank Test) - Paired comparison    
-    stat, p_val = wilcoxon(emd_df["EMD_raw"], emd_df["EMD_corr"], alternative='greater')
+    global_all_zero = _emd_all_zero_finite_pairs(emd_df["EMD_raw"], emd_df["EMD_corr"])
+    if global_all_zero:
+        stat, p_val = np.nan, np.nan
+    else:
+        stat, p_val = wilcoxon(
+            emd_df["EMD_raw"], emd_df["EMD_corr"], alternative='two-sided'
+        )
     
     # Save p-value to a text file for separate reporting
     if save_path is not None:
         p_val_path = os.path.join(save_path, "emd_p_value.txt")
         with open(p_val_path, "w") as f:
             f.write(f"Wilcoxon Signed-Rank Test (EMD Before vs After)\n")
-            f.write(f"Alternative hypothesis: Before > After\n")
+            f.write(f"Alternative hypothesis: Before != After (two-sided)\n")
+            f.write("Paired unit: marker x target plate x SOM node/population; no BH adjustment\n")
             f.write(f"Statistic: {stat:.4f}\n")
             f.write(f"P-Value: {p_val:.2e}\n")
+            if global_all_zero:
+                f.write("Status: Not testable (all valid paired differences are zero); no replacement p-value\n")
         print(f"P-value saved to: {p_val_path}")
 
     plt.figure(figsize=(7,5))
@@ -1077,7 +1420,7 @@ def plot_emd(emd_df, mad_score, save_path=None):
 
     textstr = (
         f"Mean EMD reduction = {emd_reduction_mean:.3f}\n"
-        f"Median MAD reduction = {mad_median:.3f}"
+        f"Median absolute MAD change = {mad_median:.3f}"
     )
     plt.text(0.98, 0.05, textstr, transform=plt.gca().transAxes, fontsize=11,
                 verticalalignment="bottom", horizontalalignment="right",
@@ -1095,14 +1438,31 @@ def plot_emd(emd_df, mad_score, save_path=None):
         plt.show()
     plt.close()
 
-    # PER-TARGET-PLATE BOXPLOT. Each EMD row is ref_plate -> target plate,
-    # so assign it only to plate2 instead of duplicating it under both plates.
-    emd_long = []
-    for _, row in emd_df.iterrows():
-        emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_raw'], 'Condition': 'Before', 'Marker': row['marker']})
-        emd_long.append({'Plate': row['plate2'], 'EMD': row['EMD_corr'], 'Condition': 'After', 'Marker': row['marker']})
-    
-    plot_data = pd.DataFrame(emd_long)
+    # PER-TARGET-PLATE BOXPLOT. Use the marker as the observational unit:
+    # average each marker's EMD across all available cell populations/SOM nodes.
+    # Thus, each plotted point represents exactly one marker.
+    marker_emd = (
+        emd_df
+        .groupby(['plate2', 'marker'], as_index=False)
+        .agg(
+            EMD_raw=('EMD_raw', 'mean'),
+            EMD_corr=('EMD_corr', 'mean'),
+        )
+    )
+    plot_data = (
+        marker_emd
+        .melt(
+            id_vars=['plate2', 'marker'],
+            value_vars=['EMD_raw', 'EMD_corr'],
+            var_name='Condition',
+            value_name='EMD',
+        )
+        .rename(columns={'plate2': 'Plate', 'marker': 'Marker'})
+    )
+    plot_data['Condition'] = plot_data['Condition'].map({
+        'EMD_raw': 'Before',
+        'EMD_corr': 'After',
+    })
     plates_sorted = sorted(plot_data['Plate'].unique(), key=lambda x: str(x))
     
     raw_color_v = _BEFORE_COLOR
@@ -1130,15 +1490,9 @@ def plot_emd(emd_df, mad_score, save_path=None):
         ax=ax,
     )
 
-    max_points_per_box = 500
-    strip_parts = []
-    for plate in plot_data['Plate'].unique():
-        for condition in plot_data['Condition'].unique():
-            subset = plot_data[(plot_data['Plate'] == plate) & (plot_data['Condition'] == condition)]
-            if len(subset) > max_points_per_box:
-                subset = subset.sample(n=max_points_per_box, random_state=42)
-            strip_parts.append(subset)
-    df_stripplot = pd.concat(strip_parts, ignore_index=True)
+    # Keep every marker visible; marker-level aggregation leaves a manageable
+    # number of points and no further point subsampling is needed.
+    df_stripplot = plot_data
 
     # Match point clouds to the narrowed hue boxes. Seaborn's stripplot uses
     # its own fixed dodge span, which would leave points outside width=0.30.
@@ -1163,24 +1517,39 @@ def plot_emd(emd_df, mad_score, save_path=None):
                 edgecolor='black', linewidth=0.35, zorder=3,
             )
 
-    # Statistical annotation for each plate using FDR (BH) correction
+    # Statistical annotation for each plate using marker-paired values and
+    # FDR (BH) correction across target plates.
     y_max_total = plot_data['EMD'].max()
     p_values = []
     comparison_indices = []
+    all_zero_plates = []
     for i, plate in enumerate(plates_sorted):
-        raw_vals = plot_data[(plot_data['Plate'] == plate) & (plot_data['Condition'] == 'Before')]['EMD'].values
-        corr_vals = plot_data[(plot_data['Plate'] == plate) & (plot_data['Condition'] == 'After')]['EMD'].values
-        
-        if len(raw_vals) > 0 and len(corr_vals) > 0:
+        plate_pairs = (
+            plot_data[plot_data['Plate'] == plate]
+            .pivot(index='Marker', columns='Condition', values='EMD')
+            .dropna(subset=['Before', 'After'])
+        )
+
+        if not plate_pairs.empty:
+            if _emd_all_zero_finite_pairs(plate_pairs['Before'], plate_pairs['After']):
+                all_zero_plates.append(plate)
+                continue
             try:
-                if len(raw_vals) == len(corr_vals):
-                    _, p = wilcoxon(raw_vals, corr_vals)
-                else:
-                    _, p = mannwhitneyu(raw_vals, corr_vals)
-                p_values.append(p)
-                comparison_indices.append(i)
+                _, p = wilcoxon(
+                    plate_pairs['Before'].to_numpy(),
+                    plate_pairs['After'].to_numpy(),
+                )
+                if np.isfinite(p):
+                    p_values.append(p)
+                    comparison_indices.append(i)
             except Exception:
                 pass
+
+    if save_path is not None:
+        with open(os.path.join(save_path, "emd_p_value.txt"), "a") as f:
+            f.write(f"Per-plate BH family: {len(p_values)} valid target-plate tests; non-finite/untestable tests excluded\n")
+            for plate in all_zero_plates:
+                f.write(f"Target plate {plate}: P-Value: NaN; Not testable (all valid paired differences are zero); excluded from BH; no stars\n")
 
     if p_values:
         _, p_adj, _, _ = multipletests(p_values, method='fdr_bh')
@@ -1215,7 +1584,10 @@ def plot_emd(emd_df, mad_score, save_path=None):
     ax.tick_params(axis='x', labelrotation=0 if single_target else 45, labelsize=14)
     for label in ax.get_xticklabels():
         label.set_fontweight('bold')
-    ax.set_ylabel("Earth Mover's Distance (EMD)", fontsize=16, fontweight='bold', labelpad=10)
+    ax.set_ylabel(
+        "Mean Earth Mover's Distance (EMD)\nacross Cell Populations",
+        fontsize=16, fontweight='bold', labelpad=10,
+    )
     ax.set_xlabel("Target Plate", fontsize=16, fontweight='bold', labelpad=10)
     sns.despine(ax=ax)
     ax.grid(axis='y', linestyle='--', alpha=0.2, color='grey')
@@ -1251,7 +1623,7 @@ def plot_emd(emd_df, mad_score, save_path=None):
         textstr = (
             f"Plate = {plate}\n"
             f"Mean EMD reduction = {emd_reduction_mean:.3f}\n"
-            f"Median MAD reduction = {mad_plate_median:.3f}"
+            f"Median absolute MAD change = {mad_plate_median:.3f}"
         )
         plt.text(0.98, 0.05, textstr, transform=plt.gca().transAxes, fontsize=12,
                     verticalalignment="bottom", horizontalalignment="right",
@@ -1718,6 +2090,7 @@ def marker_corr(
     celltype_col=None,
     group_col=None,
     save_dir=None,
+    include_overall=False,
 ):
     """
     Evaluates biological relationship preservation by comparing marker-marker correlations 
@@ -1728,24 +2101,32 @@ def marker_corr(
         markers (list): Markers to use for correlation matrix.
         plate_col (str): Metadata column for grouping by batch.
         celltype_col (str, optional): Metadata column for grouping by cell type.
+        group_col (str, optional): Metadata column for additional grouped plots.
         save_dir (str, optional): Directory to save scatter plots and summary CSV.
+        include_overall (bool): Also calculate and plot one correlation comparison
+            using all cells, in addition to the per-plate and per-group plots.
 
     Returns:
         pd.DataFrame: Summary of Pearson R values of the correlation coefficients.
     """
     markers = [m for m in markers if m in df_before.columns and m in df_after.columns and pd.api.types.is_numeric_dtype(df_before[m]) and pd.api.types.is_numeric_dtype(df_after[m])]
+    if len(markers) < 3:
+        raise ValueError("Marker-correlation comparison requires at least three shared numeric markers.")
     
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
     
     summary_records = []
 
-    # Per-plate correlation preservation by default. Passing plate_col=None
-    # requests one overall marker-correlation comparison across all cells.
-    if plate_col is None:
-        correlation_groups = [("All cells", df_before[markers], df_after[markers], "overall")]
-    else:
-        correlation_groups = [
+    # Per-plate correlation preservation by default. The optional overall entry
+    # compares the marker-correlation matrices calculated from all cells.
+    correlation_groups = []
+    if include_overall or plate_col is None:
+        correlation_groups.append(
+            ("All cells", df_before[markers], df_after[markers], "overall")
+        )
+    if plate_col is not None:
+        correlation_groups.extend([
             (
                 str(plate),
                 df_before[df_before[plate_col] == plate][markers],
@@ -1753,7 +2134,7 @@ def marker_corr(
                 "plate",
             )
             for plate in df_before[plate_col].unique()
-        ]
+        ])
 
     for plate, df_b, df_a, level in correlation_groups:
 
@@ -1880,7 +2261,7 @@ def marker_corr(
 
     summary_df = pd.DataFrame(summary_records)
 
-    # FDR correction (Benjamini-Hochberg) across all plate + group tests
+    # FDR correction across all valid overall + plate + group tests in this call.
     if not summary_df.empty and "p_value" in summary_df.columns:
         valid = summary_df["p_value"].notna()
         p_adj = np.full(len(summary_df), np.nan)
@@ -2203,8 +2584,12 @@ def compute_celltype_variance(df_raw, df_corrected, batch_col='plate', ctx=None)
 
 def compute_metrics(df_after, markers, df_before, batch_key='plate', label_key='celltypes', subsample=10000, n_iterations=5, random_state=42):
     """
-    Compute batch correction metrics using a PAIRED bootstrapping approach.
-    For each iteration, the SAME cell indices are sampled from before and after data.
+    Compute metrics by repeated stratified paired subsampling without replacement.
+    Inputs must contain corresponding cells in identical row order, with matching
+    metadata. Shared identifiers/non-default indices are checked; inputs are never
+    truncated or reordered. Each iteration samples identical Before/After positions
+    in proportion to plate x cell-type counts (plate only if labels are unavailable).
+    Missing batch/label values are represented by the Unassigned category.
     """
 
     # 1. Fallback for label key
@@ -2218,11 +2603,8 @@ def compute_metrics(df_after, markers, df_before, batch_key='plate', label_key='
         if len(unique_vals) > 1 or (len(unique_vals) == 1 and unique_vals[0] != 'Unassigned'):
             has_labels = True
 
-    # Ensure df_before and df_after have the same index for paired sampling
-    if len(df_before) != len(df_after):
-        min_len = min(len(df_before), len(df_after))
-        df_before = df_before.iloc[:min_len].copy()
-        df_after = df_after.iloc[:min_len].copy()
+    validate_paired_data(df_before, df_after, batch_key=batch_key,
+                         label_key=actual_label_key if has_labels else None)
     
     # Limit to numeric markers
     markers = [m for m in markers if m in df_after.columns and pd.api.types.is_numeric_dtype(df_after[m])]
@@ -2234,17 +2616,50 @@ def compute_metrics(df_after, markers, df_before, batch_key='plate', label_key='
     results_before = []
     results_after = []
     
-    # Sample the same INDICES for both dataframes to ensure PAIRED testing
+    # Sample the same INDICES for both dataframes to ensure PAIRED testing.
+    # Preserve the plate x cell-type composition in the fixed-seed sample.
     common_indices = np.arange(len(df_after))
+
+    def stratified_indices(seed):
+        sample_n = min(len(common_indices), subsample)
+        if sample_n == len(common_indices):
+            return common_indices.copy()
+        columns = [batch_key]
+        if has_labels:
+            columns.append(actual_label_key)
+        strata = (
+            df_before.iloc[common_indices][columns]
+            .astype(object)
+            .fillna("Unassigned")
+            .astype(str)
+            .agg("|".join, axis=1)
+            .to_numpy()
+        )
+        rng = np.random.default_rng(seed)
+        groups = {label: np.flatnonzero(strata == label) for label in np.unique(strata)}
+        exact = {label: sample_n * len(index) / len(common_indices) for label, index in groups.items()}
+        quota = {label: min(len(groups[label]), int(np.floor(value))) for label, value in exact.items()}
+        remaining = sample_n - sum(quota.values())
+        order = sorted(groups, key=lambda label: exact[label] - quota[label], reverse=True)
+        while remaining:
+            for label in order:
+                if quota[label] < len(groups[label]):
+                    quota[label] += 1
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+        selected = [
+            rng.choice(groups[label], size=quota[label], replace=False)
+            for label in groups if quota[label]
+        ]
+        return np.sort(np.concatenate(selected))
     
-    print(f"  [METRICS] Running {n_iterations} paired bootstrap iterations (n={subsample})...")
+    print(f"  [METRICS] Running {n_iterations} paired stratified subsampling iterations (n={subsample})...")
 
     for i in range(n_iterations):
         seed = random_state + i
-        np.random.seed(seed)
-        
-        # PAIRED SAMPLING: Select same row indices for both
-        idx = np.random.choice(common_indices, size=min(len(common_indices), subsample), replace=False)
+        # PAIRED STRATIFIED SAMPLING: select the same rows for Before and After.
+        idx = stratified_indices(seed)
         
         # Extract data for this iteration
         df_sub_b = df_before.iloc[idx].copy()
@@ -2258,9 +2673,13 @@ def compute_metrics(df_after, markers, df_before, batch_key='plate', label_key='
         adata_a = ad.AnnData(X_a)
         
         for ad_obj, df_sub in zip([adata_b, adata_a], [df_sub_b, df_sub_a]):
-            ad_obj.obs[batch_key] = df_sub[batch_key].astype('category').values
-            if has_labels:
-                ad_obj.obs[actual_label_key] = df_sub[actual_label_key].astype('category').values
+            for col in [batch_key] + ([actual_label_key] if has_labels else []):
+                values = df_sub[col]
+                if values.isna().any():
+                    # Use the same missing-value group as stratification; casting
+                    # only this exceptional case preserves existing categories.
+                    values = values.astype(object).fillna('Unassigned')
+                ad_obj.obs[col] = values.astype('category').values
             
             sc.pp.scale(ad_obj)
             sc.tl.pca(ad_obj, n_comps=min(50, X_b.shape[1]-1), svd_solver='arpack', random_state=seed)
@@ -2323,7 +2742,12 @@ def compute_metrics(df_after, markers, df_before, batch_key='plate', label_key='
 def plot_metrics_comparison(metrics_before, metrics_after, panel, save_dir):
     """
     Plots a comparison of batch correction metrics before and after correction for a given panel.
-    Uses bootstrapping-based metrics (ASW, PCR, Graph Connectivity, NMI, ARI).
+    Uses repeated subsampling metrics (ASW, PCR, Graph Connectivity, NMI, ARI).
+    Each boxplot point is one paired subsampling iteration. Stars reuse the
+    existing directional empirical fraction of non-improving iteration differences
+    (>=0 for ASW-batch/PCR; <=0 for the others), BH-adjusted across displayed
+    metrics in this call. Iterations overlap and are not biological replicates;
+    these fractions are not calibrated bootstrap/permutation p-values.
 
     Args:
         metrics_before (dict): Metrics calculated from raw data.
@@ -2395,7 +2819,8 @@ def plot_metrics_comparison(metrics_before, metrics_after, panel, save_dir):
         after_means.append(a_mean if a_mean is not None else 0)
         after_stds.append(a_std if a_std is not None else 0)
         
-        # Calculate P-value using Bootstrap Hypothesis Testing (Empirical P-value)
+        # Existing directional empirical fraction across paired subsampling iterations.
+        # Preserve its calculation; do not interpret it as a calibrated bootstrap test.
         if b_vals is not None and a_vals is not None and len(b_vals) > 1 and len(a_vals) > 1:
             valid_mask = ~np.isnan(b_vals) & ~np.isnan(a_vals)
             b_clean = np.array(b_vals)[valid_mask]
@@ -2500,7 +2925,7 @@ def plot_metrics_comparison(metrics_before, metrics_after, panel, save_dir):
                     fontweight='bold', color=text_color)
 
     ax.set_ylabel('Score (Mean ± SD)', fontsize=15, fontweight='bold')
-    ax.set_title(f'Batch Correction Metrics (Bootstrapping) - {panel}', fontsize=18, fontweight='bold', pad=20)
+    ax.set_title(f'Batch Correction Metrics (Repeated Subsampling) - {panel}', fontsize=18, fontweight='bold', pad=20)
     ax.set_xticks(x)
     
     ax.set_xticklabels(plot_labels, fontsize=13, fontweight='bold')
@@ -2520,6 +2945,227 @@ def plot_metrics_comparison(metrics_before, metrics_after, panel, save_dir):
     save_path = os.path.join(save_dir, f"{panel}_metrics_summary_plot.png")
     _savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
+
+    # Save an additional distribution-level view without changing the
+    # existing mean +/- SD summary plot. Each point is one paired subsampling
+    # iteration, computed from the same cell indices Before and After.
+    boxplot_rows = []
+    for plot_position, metric_index in enumerate(indices):
+        key = metric_keys[metric_index]
+        b_tuple = metrics_before.get(key)
+        a_tuple = metrics_after.get(key)
+        if b_tuple is None or a_tuple is None:
+            continue
+
+        b_values = np.asarray(b_tuple[2], dtype=float)
+        a_values = np.asarray(a_tuple[2], dtype=float)
+        n_pairs = min(len(b_values), len(a_values))
+        for iteration in range(n_pairs):
+            if np.isfinite(b_values[iteration]):
+                boxplot_rows.append({
+                    'Metric': plot_labels[plot_position],
+                    'Metric_Key': key,
+                    'Stage': 'Before',
+                    'Iteration': iteration + 1,
+                    'Score': b_values[iteration],
+                })
+            if np.isfinite(a_values[iteration]):
+                boxplot_rows.append({
+                    'Metric': plot_labels[plot_position],
+                    'Metric_Key': key,
+                    'Stage': 'After',
+                    'Iteration': iteration + 1,
+                    'Score': a_values[iteration],
+                })
+
+    boxplot_data = pd.DataFrame(boxplot_rows)
+    if not boxplot_data.empty:
+        fig_box, ax_box = plt.subplots(figsize=(max(8, 2.5 * len(plot_labels)), 7))
+        sns.boxplot(
+            data=boxplot_data,
+            x='Metric',
+            y='Score',
+            hue='Stage',
+            order=plot_labels,
+            hue_order=['Before', 'After'],
+            palette={'Before': raw_color, 'After': corr_color},
+            width=0.6,
+            linewidth=1.5,
+            showfliers=False,
+            boxprops=dict(edgecolor="#4D5656"),
+            whiskerprops=dict(color="#4D5656"),
+            capprops=dict(color="#4D5656"),
+            medianprops=dict(color="#2C3E50", linewidth=2.0),
+            ax=ax_box,
+        )
+        sns.stripplot(
+            data=boxplot_data,
+            x='Metric',
+            y='Score',
+            hue='Stage',
+            order=plot_labels,
+            hue_order=['Before', 'After'],
+            palette={'Before': raw_color, 'After': corr_color},
+            dodge=True,
+            jitter=0.1,
+            size=4.5,
+            alpha=0.5,
+            linewidth=0.6,
+            edgecolor='black',
+            legend=False,
+            ax=ax_box,
+        )
+
+        score_min = float(boxplot_data['Score'].min())
+        score_max = float(boxplot_data['Score'].max())
+        score_span = max(score_max - score_min, score_max, 0.1)
+        bracket_top = score_max
+        for metric_position, p_val in enumerate(p_values):
+            if np.isnan(p_val):
+                continue
+            if p_val < 0.0001:
+                stars = "****"
+            elif p_val < 0.001:
+                stars = "***"
+            elif p_val < 0.01:
+                stars = "**"
+            elif p_val < 0.05:
+                stars = "*"
+            else:
+                stars = "ns"
+
+            local_max = boxplot_data.loc[
+                boxplot_data['Metric'] == plot_labels[metric_position],
+                'Score',
+            ].max()
+            y_pos = local_max + 0.025 * score_span
+            height = 0.018 * score_span
+            stage_offset = 0.15
+            ax_box.plot(
+                [
+                    metric_position - stage_offset,
+                    metric_position - stage_offset,
+                    metric_position + stage_offset,
+                    metric_position + stage_offset,
+                ],
+                [y_pos, y_pos + height, y_pos + height, y_pos],
+                lw=1.4,
+                color='black',
+            )
+            ax_box.text(
+                metric_position,
+                y_pos + height,
+                stars,
+                ha='center',
+                va='bottom',
+                fontsize=13 if stars != "ns" else 11,
+                fontweight='bold',
+                color='black' if stars != "ns" else 'grey',
+            )
+            bracket_top = max(bracket_top, y_pos + height)
+
+        # Retain the category guides used by the existing summary plot.
+        y_group_line = -0.15
+        y_group_text = -0.16
+        batch_positions = [
+            plot_position
+            for plot_position, metric_index in enumerate(indices)
+            if metric_index <= 2
+        ]
+        if batch_positions:
+            start, end = batch_positions[0], batch_positions[-1]
+            ax_box.plot(
+                [start - width, end + width],
+                [y_group_line, y_group_line],
+                color="#2E4053",
+                lw=2,
+                transform=ax_box.get_xaxis_transform(),
+                clip_on=False,
+            )
+            ax_box.text(
+                (start + end) / 2,
+                y_group_text,
+                'Batch Removal',
+                ha='center',
+                va='top',
+                fontsize=11,
+                fontweight='bold',
+                color='#2E4053',
+                transform=ax_box.get_xaxis_transform(),
+            )
+
+        conservation_positions = [
+            plot_position
+            for plot_position, metric_index in enumerate(indices)
+            if metric_index >= 3
+        ]
+        if conservation_positions:
+            start, end = conservation_positions[0], conservation_positions[-1]
+            ax_box.plot(
+                [start - width, end + width],
+                [y_group_line, y_group_line],
+                color="#1E8449",
+                lw=2,
+                transform=ax_box.get_xaxis_transform(),
+                clip_on=False,
+            )
+            ax_box.text(
+                (start + end) / 2,
+                y_group_text,
+                'Bio-conservation',
+                ha='center',
+                va='top',
+                fontsize=11,
+                fontweight='bold',
+                color='#1E8449',
+                transform=ax_box.get_xaxis_transform(),
+            )
+
+        ax_box.set_ylim(min(0, score_min - 0.03 * score_span),
+                        bracket_top + 0.09 * score_span)
+        ax_box.set_xlabel("")
+        ax_box.set_ylabel(
+            'Score (Paired Subsampling Distribution)',
+            fontsize=15,
+            fontweight='bold',
+        )
+        ax_box.set_title(
+            f'Batch Correction Metrics (Boxplot) - {panel}',
+            fontsize=18,
+            fontweight='bold',
+            pad=20,
+        )
+        ax_box.tick_params(axis='x', labelsize=13)
+        ax_box.tick_params(axis='y', labelsize=12)
+        for tick_label in ax_box.get_xticklabels() + ax_box.get_yticklabels():
+            tick_label.set_fontweight('bold')
+        ax_box.grid(axis='y', linestyle='--', alpha=0.3)
+        sns.despine(ax=ax_box)
+
+        handles, legend_labels = ax_box.get_legend_handles_labels()
+        legend = ax_box.legend(
+            handles[:2],
+            legend_labels[:2],
+            title="Stage",
+            frameon=True,
+            loc='upper left',
+            bbox_to_anchor=(1.02, 1),
+            borderaxespad=0,
+            fontsize=12,
+            title_fontsize=13,
+            prop={'weight': 'bold'},
+        )
+        plt.setp(legend.get_title(), fontweight='bold')
+
+        fig_box.tight_layout(rect=[0, 0.05, 1, 1])
+        boxplot_path = os.path.join(save_dir, f"{panel}_metrics_boxplot.png")
+        _savefig(boxplot_path, fig=fig_box, dpi=300, bbox_inches='tight')
+        plt.close(fig_box)
+
+        boxplot_data.to_csv(
+            os.path.join(save_dir, f"{panel}_metrics_subsampling_values.csv"),
+            index=False,
+        )
     
     # Save results to CSV
     summary_data = {
@@ -2531,7 +3177,7 @@ def plot_metrics_comparison(metrics_before, metrics_after, panel, save_dir):
     }
     summary_df = pd.DataFrame(summary_data)
     summary_df.to_csv(os.path.join(save_dir, f"{panel}_metrics_summary.csv"), index=False)
-    print(f"[METRIC] Saved Bootstrapping metrics and plots to {save_dir}")
+    print(f"[METRIC] Saved repeated-subsampling metrics and plots to {save_dir}")
 
 
 # Plot variance of each marker within each cell type before and after correction, side by side for both panels
@@ -2981,6 +3627,7 @@ def load_and_preprocess_panel_batch(panel_name, dataset_to_process, ctx, verbose
     if markers:
         markers = [m for m in markers if m not in ctx.meta_cols and m != "original_filename"]
 
+    validate_paired_data(df_b, df_a)
     return df_b, df_a, markers
     
 

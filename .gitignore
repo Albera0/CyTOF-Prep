@@ -43,6 +43,24 @@ secrets*.json
 /external_validation_z247/
 /paper_analysis/
 
+# Local paper revisions, private validation and delivery workspaces.
+# Root-scoped rules keep public src/, examples/, metadata/ and tests/ visible.
+/private_ohsu_eloise_benchmark_20261004/
+/CyTOF_CI_Delivery/
+/Baseline_Recovery_Audit_20261101/
+/Revision_Eloise_Round2/
+/Stage[4-9]*/
+/Figure1C_Connector_Alignment_20261110/
+/Figure4*_Refinement/
+/Figure5BC_Negative_Margin_Refinement/
+/S6_Negative_Margin_Refinement/
+/Final_Scientific_Manuscript_Review/
+/Supervisor_Revision_Provenance_Audit/
+/V2_Readonly_Review_20261108/
+/MASTER_TASK_LIST_IMPACT.md
+/CyTOF-CI_Eloise_Round2_20261101.zip
+/matrix_*.csv
+
 # ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------

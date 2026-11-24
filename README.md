@@ -15,15 +15,22 @@ A modular Python package for CyTOF (Cytometry by Time-of-Flight) data processing
 ## Getting Started
 
 ### 1. Prerequisites
-The package requires Python 3.8 or higher. Install the necessary dependencies using pip:
+The frozen handover environment uses Python 3.8.20. Recreate it with Conda:
 
 ```powershell
-pip install pandas numpy scanpy matplotlib seaborn openpyxl scipy FlowCytometryTools
+conda env create -f environment.yml
+conda activate cytof-ci
+```
+
+Alternatively, in an existing Python 3.8 environment:
+
+```powershell
+pip install -r requirements.txt
 ```
 
 > **Note on Data Compatibility**: If your raw FCS/CSV data lacks `Time` or `Event_length` columns, or does not have pre-assigned cell types, the pipeline will still work.
 > - **Missing `Time`**: The pipeline will automatically skip the time-drift correction step but will still perform batch correction using the anchor samples.
-> - **Missing `cell_type`**: You can set `celltype_gating, celltype2correct, stable_marker` to an empty list in `meta.json` or perform a preliminary clustering/gating before running the pipeline.
+> - **Missing cell-type labels**: Set `celltype2correct` to an empty list to skip time correction, or provide cell-type annotations/gating before running it. Keep `stable_marker` as a non-empty string even when time correction is skipped.
 
 ### 2. Configuration (`meta.json`)
 The pipeline is driven by a configuration file (`meta.json`) located in the `metadata/` directory. Below is the explanation for each parameter:
@@ -34,9 +41,11 @@ The pipeline is driven by a configuration file (`meta.json`) located in the `met
 - `meta_cols`: List of columns that contain metadata rather than scientific signal (e.g., Time, Event_length, panel). These are excluded from mathematical correction logic.
 - `celltypes`: The complete list of cell population labels expected in the data. 
 - `celltype_gating`: The specific cell types used for high-level gating analysis. (If the cell_type column already exists in the raw data, it can be ignored.)
-- `celltype2correct`: The subset of biological cell types that should undergo batch correction (If the cell type is not clear, do not perform time correction for this cell type.).
-- `stable_marker`: A marker (like DNA) expected to have constant intensity, used for time-drift correction.
+- `celltype2correct`: The subset of biological cell types used for time-drift correction. An empty list skips time correction; anchor-based batch correction still applies at plate level.
+- `stable_marker`: One reference-marker column name as a non-empty string, for example `"DNA"`. Choose the channel appropriate for your data; lists and empty strings are invalid. If time correction runs, this column must exist in the panel.
 - `true_markers`: The list of markers (proteins) included in the core analysis and visualization.
+
+Time correction uses the group mean of this single reference channel divided by its centered rolling median. The default window is 500 cells (adapted to group size and made odd), and factors are clipped to 0.3–3.0. The subsequent arcsinh cofactor of 5 and anchor-based correction are unchanged.
 
 ### 3. Metadata Mapping
 To ensure visual consistency across disparate panels:
@@ -80,7 +89,11 @@ python -m src.pipeline all --dataset D0 --config metadata/meta.json
 
 ## Result Analysis Guide
 
-All analytical results are stored in `output/results/{dataset}/{panel}/`. Below is a detailed explanation of the significance of each folder and every image generated:
+Batch metrics use repeated, proportional plate x cell-type subsampling **without replacement** (plate only when labels are unavailable). Missing batch/label values form an `Unassigned` category in both stratification and metric inputs. `compute_metrics` defaults to 10,000 cells, five iterations and seed 42; the batch pipeline requests 20 iterations. Before/After must contain corresponding events in the same row order, with matching metadata. Counts, shared identifiers/metadata and usable indices are checked; mismatches raise errors rather than truncating or matching cells. Without verifiable identifiers/indices, a warning states the positional-pairing assumption. Per-file correction preserves event order, but concatenation, grouped correction and independently sampled CSVs can change global order; preserve event identities when preparing evaluation inputs.
+
+The core environment is Python-only. On Windows, Somoclu may import while its training DLL is unavailable; EMD's existing fallback then uses KMeans, so population assignments/results can differ. This is reported at runtime; dependency pins alone do not verify native DLL availability.
+
+Pipeline diagnostics are stored under `{output_dir}/{dataset}/{panel}/`, with cross-panel summaries under `{output_dir}/{dataset}/`. Per-file correction outputs are under `{output_dir}/time_corrected/` and `{output_dir}/corrected/`. Below are the diagnostic folders and outputs:
 
 ### 1. Time-Drift Correction Evaluation (`time-analysis`)
 These visualizations verify if signal drift occurring *during* the acquisition of a single sample (time-drift) have been repaired.
@@ -156,13 +169,23 @@ UMAP visual proof of batch removal.
     *   **What it shows**: Earth Mover's Distance (EMD) distributions between pairs of plates.
     *   **Significance**: Lower EMD = higher similarity. 
         *   **Global KDE**: Overall shift in EMD distributions (Raw vs Corrected).
-        *   **Per-Plate Boxplot**: Statistical comparison of EMD reduction across all markers for each plate.
-        *   **Per-Marker Boxplot**: Detailed view of how different markers' EMD values changed within a specific plate.
+        *   **Per-Plate Boxplot**: Each point is one marker's mean EMD across cell populations; Before and After are compared as marker-paired values for each plate.
+        *   **Per-Marker Boxplot**: Detailed row-level EMD distribution within a target plate.
+    *   **Statistics**: The global two-sided Wilcoxon pairs marker x target-plate x SOM-node/population rows, without BH adjustment. The per-target-plate boxplot first averages populations for each marker, pairs those marker means, then applies BH across successfully computed target-plate tests in that call. These are different statistical units, not independent biological replicates; no paper-specific five-test family is used. `emd_results.csv` preserves the row-level inputs and `emd_p_value.txt` describes the global test. MAD score is a median absolute change, not a signed reduction.
+    *   **All-zero paired differences**: When all finite Before/After pairs have zero differences, the test is reported as NaN / Not testable. Plotting continues without significance stars for that comparison. Per-plate BH includes only valid tests; untestable plates are listed as excluded in `emd_p_value.txt`. No replacement p-value is assigned.
     *   **Interpretation**: A successful batch correction will show the "Corrected" (Blue) KDE/Boxplot shifted significantly to the **left** (lower values) compared to "Raw" (Red).
 
+#### **Folder: Batch_KDE_JSD/**
+
+`compute_kde_jsd` compares each target plate with the reference, optionally within an anchor. The retained KDE-JSD name/CSV fields contain the minimum **base-2 Jensen–Shannon distance**, i.e. the square root of the divergence, over bounded translations of the smoothed target histogram. The existing pooled bandwidth, 512-bin grid and shift search are unchanged; the distance ranges from 0 to 1.
+
+Finite values are sampled without replacement, independently per state/plate/marker, up to 20,000 cells with seed 42. Equal seeds do not establish cell-identity pairing. `kde_jsd_results.csv` stores distances, shifts and sample counts; `kde_jsd_statistics.csv` reports the existing unadjusted two-sided Wilcoxon over matched marker-target-plate summaries. Those summaries share references and are not independent biological replicates. Insufficient finite samples or failed density calculations yield NaN; all-invalid pairs produce statistics with no plot/test.
+
 #### **Folder: Batch_MarkerCorrelation/**
-*   **`scatter_plate_{plate}.png`** & **`scatter_group_{celltype}.png`**: (from `marker_corr`)
+*   **`scatter_overall.png`**, **`scatter_plate_{plate}.png`** & **`scatter_group_{celltype}.png`**: (from `marker_corr`)
     *   **What it shows**: Scatter plots of marker-marker correlations (e.g., Correlation of CD3 vs CD4) "Before" vs "After".
+    *   **Overall plot**: Correlation preservation across all cells and all marker pairs.
+    *   **Output**: `marker_correlation_summary.csv` includes overall, plate and requested group summaries. Pearson correlation compares the upper triangles of Before/After marker-correlation matrices; BH covers all valid summary tests in the call. Overall correlation is enabled by the batch pipeline and does not replace plate/group outputs.
     *   **Significance**: Points should fall on the diagonal red line ($y=x$), proving that the correction didn't destroy biological co-expression patterns.
 
 #### **Folder: Variance/** (Batch Phase)
@@ -176,7 +199,7 @@ UMAP visual proof of batch removal.
     *   **What it shows**: Distribution of variance explained by factors across all individual markers.
     *   **Significance**: Allows identification of specific markers that are highly affected by batch effects (**Plate** factor). High-quality correction should minimize the Plate variance component for most markers.
 *   **`{panel}_metrics_summary_plot.png`**: (from `plot_metrics_comparison`)
-    *   **What it shows**: Integrated benchmarking using **scIB** metrics with **paired bootstrapping** (n=20) and **statistical SIGNIFICANCE**:
+    *   **What it shows**: scIB metric means and standard deviations across paired repeated subsampling iterations (20 in the pipeline):
         *   **Batch Removal** (Goal: Minimal technical variance): 
             *   **ASW (Batch)**: Measures how well the batches are mixed. (Lower is Better - Expect **DECREASE**)
             *   **PCR comparison**: Principal Component Regression of batch variance. (Lower is Better - Expect **DECREASE**)
@@ -185,10 +208,12 @@ UMAP visual proof of batch removal.
             *   **ASW (Cell-type)**: Measures biological separation between different cell types. (Higher is Better - Expect **STABILITY/INCREASE**)
             *   **NMI**: Normalized Mutual Information of clustering vs. ground truth. (Higher is Better - Expect **STABILITY/INCREASE**)
             *   **ARI**: Adjusted Rand Index of clustering vs. ground truth. (Higher is Better - Expect **STABILITY/INCREASE**)
+*   **`{panel}_metrics_boxplot.png`** and **`{panel}_metrics_subsampling_values.csv`**:
+    *   **What they show**: An additional boxplot and its source data. Each point is one paired cell-subsampling iteration. The original mean ± SD summary plot is retained unchanged.
     *   **Statistical Annotations**: 
-        *   **Stars (`*` to `****`)**: Indicate significance based on empirical P-values from bootstrapping with **FDR (Benjamini-Hochberg)** correction.
+        *   **Stars (`*` to `****`)**: Retain the existing BH-adjusted directional empirical fractions across paired iteration differences: fraction >= 0 for ASW-batch/PCR, fraction <= 0 for the other metrics. BH covers displayed metrics in the call. Iterations overlap; these are not independent biological replicates or calibrated bootstrap/permutation p-values. Thresholds are <0.05, <0.01, <0.001 and <0.0001.
         *   **ns**: Non-significant changes.
-    *   **Significance**: Quantitative proof of batch removal effectiveness vs. biological preservation. Success is characterized by significant improvements in batch removal metrics while maintaining or improving bio-conservation scores.
+    *   **Source data**: `{panel}_metrics_subsampling_values.csv` stores each finite metric/stage/iteration value used in the boxplot; `{panel}_metrics_summary.csv` stores means and standard deviations.
 
 ---
 

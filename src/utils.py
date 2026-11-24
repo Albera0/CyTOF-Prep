@@ -19,6 +19,7 @@ from patsy import dmatrix
 from FlowCytometryTools import FCMeasurement
 from glob import glob
 from collections import defaultdict
+from .correction import _validate_stable_marker
 
 
 _BEFORE_COLOR = "#F56455"
@@ -260,7 +261,8 @@ def get_config(config_path=None, config_dict=None):
     config_path : str, optional
         Path to config.json
     config_dict : dict, optional
-        Dictionary containing configuration
+        Dictionary containing configuration. stable_marker must be a non-empty
+        string naming one reference marker.
 
     Returns
     -------
@@ -292,6 +294,8 @@ def get_config(config_path=None, config_dict=None):
         if key not in config:
             raise ValueError(f"Missing required config key: {key}")
 
+    _validate_stable_marker(config["stable_marker"])
+
     # optional fields
     config["celltype_gating"] = config.get("celltype_gating", [])
     config["metal_to_marker"] = config.get("metal_to_marker", {})
@@ -320,7 +324,7 @@ class CyTOFContext:
         self.celltypes = config["celltypes"]
         self.celltype_gating = config["celltype_gating"]
         self.celltype2correct = config["celltype2correct"]
-        self.stable_marker = config["stable_marker"]
+        self.stable_marker = _validate_stable_marker(config["stable_marker"])
         self.true_markers = config["true_markers"]
         self.metal_to_marker = config.get("metal_to_marker", {})
         self.pheno_markers = config.get("pheno_markers", None)
